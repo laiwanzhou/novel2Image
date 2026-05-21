@@ -55,7 +55,12 @@ NOVEL_VIS_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/nov
 NOVEL_VIS_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:55432/novel_visualization_test
 NOVEL_VIS_EMBEDDING_PROVIDER=fake
 NOVEL_VIS_LLM_PROVIDER=fake
+NOVEL_VIS_LLM_API_BASE=
+NOVEL_VIS_LLM_API_KEY=
+NOVEL_VIS_LLM_MODEL=
 ```
+
+Copy the root `.env.example` to `.env` for local overrides. Do not commit `.env`.
 
 ## PostgreSQL + pgvector
 
@@ -118,6 +123,84 @@ Run fake chapter extraction:
 ```powershell
 .\.venv\Scripts\python -m app.cli.main extract-chapter --chapter-id <chapter_id>
 ```
+
+With the default `NOVEL_VIS_LLM_PROVIDER=fake`, extraction returns deterministic empty candidate lists unless tests inject a fake response.
+
+To use an OpenAI-compatible FastGPT workflow instead:
+
+```powershell
+$env:NOVEL_VIS_LLM_PROVIDER="fastgpt"
+$env:NOVEL_VIS_LLM_API_BASE="https://api.deepseek.com"
+$env:NOVEL_VIS_LLM_API_KEY="<your-api-key>"
+$env:NOVEL_VIS_LLM_MODEL="deepseek-v4-pro"
+.\.venv\Scripts\python -m app.cli.main extract-chapter --chapter-id <chapter_id>
+```
+
+The same provider setting is used by the Workspace "extract selected chapter" action (`POST /chapters/{chapter_id}/extract`).
+
+The FastGPT provider calls the OpenAI-compatible chat completions endpoint:
+
+```text
+POST {NOVEL_VIS_LLM_API_BASE}/v1/chat/completions
+```
+
+Expected model output is strict JSON:
+
+```json
+{
+  "events": [
+    {
+      "character_id": "confirmed-character-uuid",
+      "character_name": "optional display name",
+      "chapter_index": 1,
+      "event_summary": "what happened",
+      "event_type": "identity",
+      "is_long_term_change": true,
+      "affected_fields": ["identity"],
+      "source_chunk_ids": ["chunk-uuid"],
+      "confidence": 0.8,
+      "explanation": "why the evidence supports this"
+    }
+  ],
+  "state_changes": [
+    {
+      "character_id": "confirmed-character-uuid",
+      "character_name": "optional display name",
+      "event_index": 0,
+      "changed_fields": [
+        {
+          "field": "identity",
+          "before": "old value",
+          "after": "new value",
+          "source_chunk_ids": ["chunk-uuid"],
+          "confidence": 0.8
+        }
+      ],
+      "source_chunk_ids": ["chunk-uuid"],
+      "confidence": 0.8,
+      "explanation": "why the field changed"
+    }
+  ]
+}
+```
+
+Extraction remains review-first:
+
+- LLM output creates only candidate `CharacterEvent` and candidate `CharacterStateChange`.
+- It does not create or confirm `CharacterState`.
+- It does not bypass manual review.
+- `character_id` must reference an existing confirmed character.
+- Every event, state change, and changed field must include non-empty `source_chunk_ids` from the current chapter.
+
+Common extraction errors:
+
+- Missing `NOVEL_VIS_LLM_API_KEY`, `NOVEL_VIS_LLM_API_BASE`, or `NOVEL_VIS_LLM_MODEL`.
+- Model returns prose instead of JSON.
+- Model wraps invalid JSON in a code fence.
+- Model omits top-level `events` or `state_changes`.
+- Model omits `source_chunk_ids`.
+- Model references chunks outside the selected chapter.
+- Model references a character that has not been confirmed yet.
 
 Review character candidates:
 

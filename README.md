@@ -18,7 +18,8 @@ Included:
 - TXT / Markdown import through local CLI flows
 - chapter and chunk storage
 - fake embedding provider for MVP validation
-- fake LLM provider for extraction workflow validation
+- fake LLM provider for default extraction workflow validation
+- optional FastGPT/OpenAI-compatible LLM provider for real chapter extraction
 - character, alias, event, and state review workflows
 - evidence-backed prompt generation
 - thin Novel Workspace UI
@@ -28,7 +29,6 @@ Not included in the current implementation:
 
 - Qdrant
 - Neo4j
-- FastGPT integration
 - real LLM extraction
 - image generation API
 - crawler integration in the product UI

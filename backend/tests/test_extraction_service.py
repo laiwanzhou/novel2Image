@@ -333,6 +333,25 @@ def test_extraction_blocks_unconfirmed_character_from_candidate_outputs(pg_sessi
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
+def test_extraction_prompt_includes_confirmed_character_ids(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider()
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls
+    user_prompt = provider.calls[0][1]
+    assert str(fixture.character.id) in user_prompt
+    assert "Lin Qing" in user_prompt
+    assert "confirmed_characters" in user_prompt
+
+
 class ExtractionFixture:
     def __init__(self, novel: Novel, chapter: Chapter, chunk: ChapterChunk, character: Character) -> None:
         self.novel = novel

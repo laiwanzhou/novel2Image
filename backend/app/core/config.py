@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     test_database_url: str = "postgresql+psycopg://postgres:postgres@localhost:55432/novel_visualization_test"
     embedding_provider: str = "fake"
     llm_provider: str = "fake"
+    llm_api_base: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -41,7 +41,12 @@ def extract_chapter(chapter_id: uuid.UUID, db: Session = Depends(get_db)) -> dic
         state_repository=StateRepository(db),
         chunk_repository=ChunkRepository(db),
         character_repository=CharacterRepository(db),
-        llm_provider=get_llm_provider(settings.llm_provider),
+        llm_provider=get_llm_provider(
+            settings.llm_provider,
+            api_base=settings.llm_api_base,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+        ),
     ).extract_chapter_candidates(chapter_id)
     chapter = ChunkRepository(db).get_chapter(chapter_id)
     if chapter is None:

@@ -87,7 +87,12 @@ def embed_book(novel_id: UUID = typer.Option(...)) -> None:
 @app.command("extract-chapter")
 def extract_chapter(chapter_id: UUID = typer.Option(...)) -> None:
     settings = get_settings()
-    llm_provider = get_llm_provider(settings.llm_provider)
+    llm_provider = get_llm_provider(
+        settings.llm_provider,
+        api_base=settings.llm_api_base,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+    )
     with SessionLocal() as session:
         result = ExtractionService(
             state_repository=StateRepository(session),

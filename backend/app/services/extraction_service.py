@@ -219,6 +219,10 @@ class ExtractionService:
         return "Extract candidate character events and field-level state changes with chunk evidence."
 
     def _user_prompt(self, *, chapter: Chapter, chunks: list[ChapterChunk]) -> str:
+        confirmed_characters = self.character_repository.list_characters(
+            chapter.novel_id,
+            ReviewStatus.CONFIRMED.value,
+        )
         payload = {
             "chapter": {
                 "id": str(chapter.id),
@@ -226,6 +230,14 @@ class ExtractionService:
                 "summary": chapter.summary,
                 "chapter_index": chapter.chapter_index,
             },
+            "confirmed_characters": [
+                {
+                    "id": str(character.id),
+                    "canonical_name": character.canonical_name,
+                    "description": character.description,
+                }
+                for character in confirmed_characters
+            ],
             "chunks": [
                 {
                     "id": str(chunk.id),
