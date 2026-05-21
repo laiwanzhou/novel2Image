@@ -18,6 +18,7 @@ Included:
 - TXT / Markdown import through local CLI flows
 - chapter and chunk storage
 - fake embedding provider for MVP validation
+- fake LLM provider for extraction workflow validation
 - character, alias, event, and state review workflows
 - evidence-backed prompt generation
 - thin Novel Workspace UI
@@ -31,6 +32,14 @@ Not included in the current implementation:
 - real LLM extraction
 - image generation API
 - crawler integration in the product UI
+
+## Data And Reproducibility
+
+This repository intentionally does not include local PostgreSQL data, `.env` files, logs, virtual environments, frontend build output, or crawled novel text.
+
+Any `novel_id` created on one machine is local to that machine's PostgreSQL database. After cloning, import a local TXT/Markdown sample, then run `chunk-book` and `embed-book` to create your own `novel_id`.
+
+The operator preview API uses a small committed sample under `backend/data/samples/` so tests and the UI can run without the real crawled novel.
 
 ## Local Startup
 

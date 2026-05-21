@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -10,7 +11,8 @@ from fastapi import APIRouter
 router = APIRouter(prefix="/operator", tags=["operator"])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-CRAWLED_DIR = PROJECT_ROOT / "backend" / "data" / "crawled" / "youhun-qishi-wang"
+DEFAULT_PREVIEW_DIR = PROJECT_ROOT / "backend" / "data" / "samples" / "crawled-novel"
+CRAWLED_DIR = Path(os.getenv("NOVEL_VIS_CRAWLED_PREVIEW_DIR", str(DEFAULT_PREVIEW_DIR)))
 NOVEL_MD_PATH = CRAWLED_DIR / "novel.md"
 MANIFEST_PATH = CRAWLED_DIR / "manifest.json"
 PREVIEW_CHAR_LIMIT = 1800

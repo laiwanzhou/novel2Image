@@ -1,0 +1,28 @@
+{
+  "source_site": "sample.local",
+  "source_url": "sample://crawled-novel",
+  "title": "幽魂骑士王的地下城工程（示例）",
+  "chapter_count": 2,
+  "fetched_at": "2026-05-21T00:00:00Z",
+  "chapters": [
+    {
+      "index": 1,
+      "title": "第1章 【隆多兰的魔王与穿越者的幽灵】",
+      "url": "sample://crawled-novel/1",
+      "page_urls": [
+        "sample://crawled-novel/1",
+        "sample://crawled-novel/1-2"
+      ],
+      "word_count": 118
+    },
+    {
+      "index": 2,
+      "title": "第2章 【塔莉亚与萨麦尔】",
+      "url": "sample://crawled-novel/2",
+      "page_urls": [
+        "sample://crawled-novel/2"
+      ],
+      "word_count": 65
+    }
+  ]
+}

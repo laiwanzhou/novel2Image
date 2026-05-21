@@ -4,18 +4,25 @@
 项目路径：
 D:\py_code\vibe-coing-project4
 
-当前本地服务约定：
+当前阶段：
+- Phase 1 MVP：PostgreSQL + pgvector 单体应用。
+- 当前使用 fake embedding provider 和 fake LLM provider，方便本地验证链路。
+- 尚未接入 Qdrant、Neo4j、FastGPT、真实 LLM 或图片生成 API。
+
+本地服务约定：
 - PostgreSQL + pgvector：localhost:5432
 - Docker 容器名：novel-vis-pgvector
-- 后端 FastAPI：http://127.0.0.1:8001
-- 前端 Vite：http://127.0.0.1:5173
+- FastAPI 后端：http://127.0.0.1:8001
+- Vite 前端：http://127.0.0.1:5173
 
 为什么后端默认用 8001：
-之前 8000 被无关服务占用。为了不误杀别的项目，本项目后端使用 8001，前端通过
+之前 8000 可能被无关服务占用。为了避免误杀其他项目，本项目本地脚本使用 8001。
+前端需要通过下面的环境变量连接后端：
+
 VITE_API_BASE_URL=http://127.0.0.1:8001
-连接后端。
 
 一键启动：
+
 1. 打开 PowerShell。
 2. 执行：
 
@@ -27,7 +34,8 @@ VITE_API_BASE_URL=http://127.0.0.1:8001
    powershell -ExecutionPolicy Bypass -File D:\py_code\vibe-coing-project4\scripts\start-local.ps1
 
 脚本会做这些事：
-1. 检查 Docker 是否可用；如 Docker Desktop 没启动，会尝试启动。
+
+1. 检查 Docker 是否可用。
 2. 启动或创建 novel-vis-pgvector 容器。
 3. 等待 localhost:5432 可连接。
 4. 执行后端 Alembic migration。
@@ -36,48 +44,53 @@ VITE_API_BASE_URL=http://127.0.0.1:8001
 7. 把日志写到 D:\py_code\vibe-coing-project4\logs。
 
 启动后访问：
+
 http://127.0.0.1:5173
 
 后端健康检查：
+
 http://127.0.0.1:8001/health
 
-常用 novel_id：
-8fe463f2-22a2-46c9-a151-313f44adb6a3
+重要说明：
 
-不要继续使用旧的不完整 novel_id：
-85241da3-e0f9-436c-a58d-b2f2ebfaf9ad
-
-日志位置：
-- logs\backend-8001.out.log
-- logs\backend-8001.err.log
-- logs\frontend-5173.out.log
-- logs\frontend-5173.err.log
+- 仓库不会包含本机 PostgreSQL 数据。
+- 仓库不会包含真实爬取的小说正文或 manifest。
+- 本机已有 novel_id 不会随 clone 一起存在。
+- clone 后需要重新 import-book、chunk-book、embed-book，生成新的 novel_id。
+- 不要把其他机器上的本机 novel_id 当作可复用数据；clone 后请重新导入并生成新的 novel_id。
 
 手动启动命令参考：
 
 启动数据库容器：
+
 docker start novel-vis-pgvector
 
 执行迁移：
+
 cd D:\py_code\vibe-coing-project4\backend
 .\.venv\Scripts\python -m alembic upgrade head
 
 启动后端：
+
 cd D:\py_code\vibe-coing-project4\backend
 .\.venv\Scripts\python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8001
 
 启动前端：
+
 cd D:\py_code\vibe-coing-project4\frontend
 $env:VITE_API_BASE_URL="http://127.0.0.1:8001"
 npm run dev -- --host 127.0.0.1 --port 5173
 
 停止服务：
-- 可以关闭对应 PowerShell/Node/Python 进程。
+
+- 可以关闭对应 PowerShell / Node / Python 进程。
 - 或在任务管理器中结束本项目的 python.exe / node.exe。
 - 数据库容器可用：
+
   docker stop novel-vis-pgvector
 
 注意：
+
 - 不要随意停止 8000 上的无关服务。
 - 如果 Docker Desktop 没启动，PostgreSQL 容器不会可用。
-- 如果前端能打开但数据加载失败，优先检查后端是否是 8001，以及前端是否使用了 VITE_API_BASE_URL=http://127.0.0.1:8001。
+- 如果前端能打开但数据加载失败，优先检查后端是否是 8001，以及前端是否设置了 VITE_API_BASE_URL=http://127.0.0.1:8001。

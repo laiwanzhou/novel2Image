@@ -31,7 +31,7 @@ Implemented in this phase:
 
 Not implemented in this phase:
 
-- Crawlers or site-specific scraping.
+- Product crawler integration. A site-specific operator crawler exists under `backend/scripts/` for manual validation only; it writes local files and is not connected to FastAPI, Workspace, or the database.
 - Qdrant.
 - Neo4j.
 - Celery / Redis task orchestration.
@@ -165,6 +165,22 @@ GET  /prompts/{prompt_generation_id}
 
 `ValueError` responses are mapped to HTTP `400` with `{"detail": "..."}`.
 
+## Operator Preview Sample
+
+`GET /operator/crawled-novel-preview` defaults to a small committed sample under:
+
+```text
+backend/data/samples/crawled-novel/
+```
+
+This keeps clone-and-test reproducible without committing real crawled novel text. To point the operator preview at a local crawler output directory, set:
+
+```powershell
+$env:NOVEL_VIS_CRAWLED_PREVIEW_DIR="D:\path\to\crawler-output"
+```
+
+The directory must contain `novel.md` and `manifest.json`.
+
 ## Novel Workspace APIs
 
 Read-only workspace queries:
@@ -209,6 +225,6 @@ Run migration SQL generation:
 Current expected baseline:
 
 ```text
-72 passed
+105 passed
 ruff: All checks passed
 ```

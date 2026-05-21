@@ -19,12 +19,12 @@ def test_operator_crawled_novel_preview_returns_fixed_file_summary(pg_session: S
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["novel_md_path"].endswith("backend\\data\\crawled\\youhun-qishi-wang\\novel.md")
-    assert payload["manifest_path"].endswith("backend\\data\\crawled\\youhun-qishi-wang\\manifest.json")
-    assert payload["title"] == "幽魂骑士王的地下城工程"
-    assert payload["chapter_count"] == 5
+    assert payload["novel_md_path"].endswith("backend\\data\\samples\\crawled-novel\\novel.md")
+    assert payload["manifest_path"].endswith("backend\\data\\samples\\crawled-novel\\manifest.json")
+    assert payload["title"] == "幽魂骑士王的地下城工程（示例）"
+    assert payload["chapter_count"] == 2
     assert payload["chapters"][0]["title"] == "第1章 【隆多兰的魔王与穿越者的幽灵】"
-    assert payload["chapters"][0]["word_count"] == 2770
+    assert payload["chapters"][0]["word_count"] == 118
     assert len(payload["chapters"][0]["page_urls"]) == 2
     assert payload["selected_chapter_index"] == 1
     assert payload["selected_chapter_title"] == "第1章 【隆多兰的魔王与穿越者的幽灵】"
