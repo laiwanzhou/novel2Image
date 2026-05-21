@@ -1,0 +1,50 @@
+# Python environments and caches
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+backend/.pytest-tmp/
+.ruff_cache/
+backend/.ruff_cache/
+*.egg-info/
+backend/*.egg-info/
+
+# Node / frontend build output
+frontend/node_modules/
+node_modules/
+frontend/dist/
+dist/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs, backups, and temporary files
+logs/
+*.log
+bak/
+tmp/
+temp/
+*.tmp
+*.bak
+*.bak-*
+
+# Local crawler outputs and real novel text
+backend/data/crawled/
+
+# Database and local runtime files
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.pid
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
