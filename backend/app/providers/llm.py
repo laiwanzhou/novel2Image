@@ -37,7 +37,9 @@ class FastGptLlmProvider:
         api_base: str | None,
         api_key: str | None,
         model: str | None,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
+        json_mode: bool = True,
+        max_tokens: int | None = 4096,
         post_json: PostJson | None = None,
     ) -> None:
         if not api_base:
@@ -50,6 +52,8 @@ class FastGptLlmProvider:
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.json_mode = json_mode
+        self.max_tokens = max_tokens
         self._post_json = post_json or self._httpx_post_json
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
@@ -61,6 +65,10 @@ class FastGptLlmProvider:
             ],
             "temperature": 0,
         }
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+        if self.json_mode:
+            payload["response_format"] = {"type": "json_object"}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -152,9 +160,19 @@ def get_llm_provider(
     api_base: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
+    json_mode: bool = True,
+    max_tokens: int | None = 4096,
+    timeout_seconds: float = 180.0,
 ) -> LlmProvider:
     if name == "fake":
         return FakeLlmProvider()
     if name == "fastgpt":
-        return FastGptLlmProvider(api_base=api_base, api_key=api_key, model=model)
+        return FastGptLlmProvider(
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            timeout=timeout_seconds,
+        )
     raise ValueError(f"Unsupported LLM provider: {name}")

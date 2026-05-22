@@ -92,6 +92,9 @@ def extract_chapter(chapter_id: UUID = typer.Option(...)) -> None:
         api_base=settings.llm_api_base,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        json_mode=settings.llm_json_mode,
+        max_tokens=settings.llm_max_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
     )
     with SessionLocal() as session:
         result = ExtractionService(

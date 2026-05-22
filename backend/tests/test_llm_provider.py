@@ -59,10 +59,82 @@ def test_fastgpt_provider_posts_openai_compatible_chat_completion_request() -> N
                     {"role": "user", "content": "user text"},
                 ],
                 "temperature": 0,
+                "max_tokens": 4096,
+                "response_format": {"type": "json_object"},
             },
-            "timeout": 60.0,
+            "timeout": 180.0,
         }
     ]
+
+
+def test_fastgpt_provider_adds_json_mode_and_max_tokens_when_enabled() -> None:
+    calls = []
+
+    def post_json(url: str, *, headers: dict[str, str], payload: dict, timeout: float) -> dict:
+        calls.append({"payload": payload, "timeout": timeout})
+        return {"choices": [{"message": {"content": '{"events": [], "state_changes": []}'}}]}
+
+    provider = FastGptLlmProvider(
+        api_base="https://fastgpt.example.com/api",
+        api_key="test-key",
+        model="workflow-model",
+        json_mode=True,
+        max_tokens=4096,
+        timeout=180,
+        post_json=post_json,
+    )
+
+    provider.generate_json("system json", "user json")
+
+    assert calls == [
+        {
+            "payload": {
+                "model": "workflow-model",
+                "messages": [
+                    {"role": "system", "content": "system json"},
+                    {"role": "user", "content": "user json"},
+                ],
+                "temperature": 0,
+                "max_tokens": 4096,
+                "response_format": {"type": "json_object"},
+            },
+            "timeout": 180,
+        }
+    ]
+
+
+def test_fastgpt_provider_omits_json_mode_when_disabled_but_keeps_max_tokens() -> None:
+    calls = []
+
+    def post_json(url: str, *, headers: dict[str, str], payload: dict, timeout: float) -> dict:
+        calls.append(payload)
+        return {"choices": [{"message": {"content": '{"events": [], "state_changes": []}'}}]}
+
+    provider = FastGptLlmProvider(
+        api_base="https://fastgpt.example.com/api",
+        api_key="test-key",
+        model="workflow-model",
+        json_mode=False,
+        max_tokens=2048,
+        post_json=post_json,
+    )
+
+    provider.generate_json("system", "user")
+
+    assert calls[0]["max_tokens"] == 2048
+    assert "response_format" not in calls[0]
+
+
+def test_fastgpt_provider_rejects_empty_content() -> None:
+    provider = FastGptLlmProvider(
+        api_base="https://fastgpt.example.com/api",
+        api_key="test-key",
+        model="workflow-model",
+        post_json=lambda url, *, headers, payload, timeout: {"choices": [{"message": {"content": ""}}]},
+    )
+
+    with pytest.raises(ValueError, match="content is empty"):
+        provider.generate_json("system", "user")
 
 
 def test_fastgpt_provider_accepts_fenced_json_response() -> None:
@@ -197,6 +269,12 @@ def test_get_llm_provider_builds_fastgpt_provider() -> None:
         api_base="https://fastgpt.example.com/api",
         api_key="test-key",
         model="workflow-model",
+        json_mode=True,
+        max_tokens=4096,
+        timeout_seconds=180,
     )
 
     assert isinstance(provider, FastGptLlmProvider)
+    assert provider.json_mode is True
+    assert provider.max_tokens == 4096
+    assert provider.timeout == 180

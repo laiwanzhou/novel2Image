@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     llm_api_base: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    llm_json_mode: bool = True
+    llm_max_tokens: int = 4096
+    llm_timeout_seconds: float = 180.0
 
     model_config = SettingsConfigDict(
         env_file=".env",

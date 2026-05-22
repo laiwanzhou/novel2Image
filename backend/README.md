@@ -58,6 +58,9 @@ NOVEL_VIS_LLM_PROVIDER=fake
 NOVEL_VIS_LLM_API_BASE=
 NOVEL_VIS_LLM_API_KEY=
 NOVEL_VIS_LLM_MODEL=
+NOVEL_VIS_LLM_JSON_MODE=true
+NOVEL_VIS_LLM_MAX_TOKENS=4096
+NOVEL_VIS_LLM_TIMEOUT_SECONDS=180
 ```
 
 Copy the root `.env.example` to `.env` for local overrides. Do not commit `.env`.
@@ -133,6 +136,9 @@ $env:NOVEL_VIS_LLM_PROVIDER="fastgpt"
 $env:NOVEL_VIS_LLM_API_BASE="https://api.deepseek.com"
 $env:NOVEL_VIS_LLM_API_KEY="<your-api-key>"
 $env:NOVEL_VIS_LLM_MODEL="deepseek-v4-pro"
+$env:NOVEL_VIS_LLM_JSON_MODE="true"
+$env:NOVEL_VIS_LLM_MAX_TOKENS="4096"
+$env:NOVEL_VIS_LLM_TIMEOUT_SECONDS="180"
 .\.venv\Scripts\python -m app.cli.main extract-chapter --chapter-id <chapter_id>
 ```
 
@@ -143,6 +149,18 @@ The FastGPT provider calls the OpenAI-compatible chat completions endpoint:
 ```text
 POST {NOVEL_VIS_LLM_API_BASE}/v1/chat/completions
 ```
+
+When `NOVEL_VIS_LLM_JSON_MODE=true`, the request body includes:
+
+```json
+{
+  "response_format": {
+    "type": "json_object"
+  }
+}
+```
+
+`NOVEL_VIS_LLM_MAX_TOKENS` is also sent as `max_tokens`. For DeepSeek JSON Output, keep JSON mode enabled and keep the prompt's explicit `json` instructions and output example. JSON mode does not replace backend validation: empty content, non-JSON content, truncated JSON, missing schema fields, missing chunk evidence, or invalid IDs still fail with `ValueError`.
 
 Expected model output is strict JSON:
 
@@ -195,6 +213,7 @@ Extraction remains review-first:
 Common extraction errors:
 
 - Missing `NOVEL_VIS_LLM_API_KEY`, `NOVEL_VIS_LLM_API_BASE`, or `NOVEL_VIS_LLM_MODEL`.
+- JSON mode responses with empty content.
 - Model returns prose instead of JSON.
 - Model wraps invalid JSON in a code fence.
 - Model omits top-level `events` or `state_changes`.

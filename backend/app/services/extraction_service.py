@@ -216,7 +216,52 @@ class ExtractionService:
         return changed_fields
 
     def _system_prompt(self) -> str:
-        return "Extract candidate character events and field-level state changes with chunk evidence."
+        return """
+You extract auditable novel character knowledge. Return strict JSON only.
+
+The JSON object must use exactly these top-level keys:
+{
+  "events": [
+    {
+      "character_id": "confirmed character_id copied exactly from confirmed_characters",
+      "chapter_index": 1,
+      "event_summary": "brief event grounded in the chapter text",
+      "event_type": "identity|motivation|relationship|appearance|personality|encounter|decision|other",
+      "is_long_term_change": false,
+      "affected_fields": ["motivation"],
+      "source_chunk_ids": ["chunk UUID copied exactly from chunks"],
+      "confidence": 0.0,
+      "explanation": "short evidence explanation"
+    }
+  ],
+  "state_changes": [
+    {
+      "character_id": "confirmed character_id copied exactly from confirmed_characters",
+      "event_index": 0,
+      "changed_fields": [
+        {
+          "field": "appearance|personality|identity|motivation|relationship_summary|visual_keywords|negative_prompt",
+          "before": null,
+          "after": "new long-term value supported by evidence",
+          "source_chunk_ids": ["chunk UUID copied exactly from chunks"]
+        }
+      ],
+      "source_chunk_ids": ["chunk UUID copied exactly from chunks"],
+      "confidence": 0.0,
+      "explanation": "why this is a long-term change"
+    }
+  ]
+}
+
+Rules:
+- Output valid json only, with no markdown and no extra top-level keys.
+- Use only confirmed character_id values from confirmed_characters.
+- Every event, state_change, and changed_field must include non-empty source_chunk_ids.
+- source_chunk_ids must be copied exactly from the provided chunks for the current chapter.
+- If there is no supported event or long-term state change, output empty arrays.
+- Do not create state_changes for temporary emotions, poses, location changes, one-off dialogue, or momentary scene lighting.
+- Do not invent facts that are not supported by source chunks.
+""".strip()
 
     def _user_prompt(self, *, chapter: Chapter, chunks: list[ChapterChunk]) -> str:
         confirmed_characters = self.character_repository.list_characters(

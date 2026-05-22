@@ -350,6 +350,12 @@ def test_extraction_prompt_includes_confirmed_character_ids(pg_session: Session)
     assert str(fixture.character.id) in user_prompt
     assert "Lin Qing" in user_prompt
     assert "confirmed_characters" in user_prompt
+    system_prompt = provider.calls[0][0]
+    assert "json" in system_prompt.lower()
+    assert '"events"' in system_prompt
+    assert '"state_changes"' in system_prompt
+    assert '"source_chunk_ids"' in system_prompt
+    assert "confirmed character_id" in system_prompt
 
 
 class ExtractionFixture:
