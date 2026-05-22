@@ -208,6 +208,7 @@ Extraction remains review-first:
 - It does not create or confirm `CharacterState`.
 - It does not bypass manual review.
 - `character_id` must reference an existing confirmed character.
+- `event_type` must be one of `appearance`, `identity`, `relationship`, `motivation`, or `other`.
 - Every event, state change, and changed field must include non-empty `source_chunk_ids` from the current chapter.
 
 Common extraction errors:
@@ -220,6 +221,7 @@ Common extraction errors:
 - Model omits `source_chunk_ids`.
 - Model references chunks outside the selected chapter.
 - Model references a character that has not been confirmed yet.
+- Model returns an unsupported `event_type` such as `decision` or `encounter`; this is rejected before persistence to protect the review data, not a database failure.
 
 Review character candidates:
 

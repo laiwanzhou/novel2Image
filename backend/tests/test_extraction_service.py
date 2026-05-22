@@ -333,6 +333,65 @@ def test_extraction_blocks_unconfirmed_character_from_candidate_outputs(pg_sessi
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
+def test_extraction_rejects_invalid_event_type_before_persisting(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    service = _service_for_event_type(pg_session, fixture, "decision")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Invalid event_type from LLM: decision. Allowed values: "
+            "appearance, identity, relationship, motivation, other"
+        ),
+    ):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    pg_session.flush()
+    assert _count_rows(pg_session, CharacterEvent) == 0
+
+
+@pytest.mark.parametrize("event_type", ["motivation", "other"])
+def test_extraction_accepts_supported_event_type(pg_session: Session, event_type: str) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    service = _service_for_event_type(pg_session, fixture, event_type)
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert len(result.events) == 1
+    assert result.events[0].event_type == event_type
+
+
+def test_extraction_rejects_invalid_changed_field_name(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "changed_fields": [
+                        {
+                            "field": "location",
+                            "after": "inner hall",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    with pytest.raises(ValueError, match="Invalid changed field from LLM: location"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
 def test_extraction_prompt_includes_confirmed_character_ids(pg_session: Session) -> None:
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
     provider = FakeLlmProvider()
@@ -356,6 +415,11 @@ def test_extraction_prompt_includes_confirmed_character_ids(pg_session: Session)
     assert '"state_changes"' in system_prompt
     assert '"source_chunk_ids"' in system_prompt
     assert "confirmed character_id" in system_prompt
+    assert '"event_type": "appearance|identity|relationship|motivation|other"' in system_prompt
+    assert '"event_type": "identity|motivation|relationship|appearance|personality|encounter|decision|other"' not in system_prompt
+    assert "decision" not in system_prompt
+    assert "encounter" not in system_prompt
+    assert "Use event_type other for discoveries, actions, battles, and dialogue." in system_prompt
 
 
 class ExtractionFixture:
@@ -364,6 +428,30 @@ class ExtractionFixture:
         self.chapter = chapter
         self.chunk = chunk
         self.character = character
+
+
+def _service_for_event_type(pg_session: Session, fixture: ExtractionFixture, event_type: str) -> ExtractionService:
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing chooses the next step.",
+                    "event_type": event_type,
+                    "is_long_term_change": event_type == "motivation",
+                    "affected_fields": ["motivation"] if event_type == "motivation" else [],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                }
+            ],
+            "state_changes": [],
+        }
+    )
+    return ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
 
 
 def _create_extraction_fixture(pg_session: Session, character_status: str) -> ExtractionFixture:

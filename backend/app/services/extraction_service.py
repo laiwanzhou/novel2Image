@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import json
 import uuid
 
-from app.core.enums import ReviewStatus
+from app.core.enums import EventType, ReviewStatus
 from app.models.character import Character
 from app.models.novel import Chapter, ChapterChunk
 from app.models.state import CharacterEvent, CharacterStateChange
@@ -10,6 +10,11 @@ from app.providers.llm import LlmProvider
 from app.repositories.characters import CharacterRepository
 from app.repositories.chunks import ChunkRepository
 from app.repositories.states import StateRepository
+from app.services.state_service import STATE_FIELDS
+
+
+ALLOWED_EVENT_TYPES = tuple(event_type.value for event_type in EventType)
+ALLOWED_EVENT_TYPES_TEXT = ", ".join(ALLOWED_EVENT_TYPES)
 
 
 @dataclass(frozen=True)
@@ -93,7 +98,7 @@ class ExtractionService:
                 EventDraft(
                     character_id=character.id,
                     event_summary=self._require_string(raw_event, "event_summary"),
-                    event_type=raw_event.get("event_type", "other"),
+                    event_type=self._require_event_type(raw_event),
                     is_long_term_change=bool(raw_event.get("is_long_term_change", False)),
                     affected_fields=list(raw_event.get("affected_fields", [])),
                     source_chunk_ids=source_chunk_ids,
@@ -205,6 +210,14 @@ class ExtractionService:
             raise ValueError(f"Extraction output requires string field: {field}")
         return value
 
+    def _require_event_type(self, raw_event: dict) -> str:
+        event_type = raw_event.get("event_type", EventType.OTHER.value)
+        if event_type not in ALLOWED_EVENT_TYPES:
+            raise ValueError(
+                f"Invalid event_type from LLM: {event_type}. Allowed values: {ALLOWED_EVENT_TYPES_TEXT}"
+            )
+        return event_type
+
     def _require_changed_fields(self, raw_change: dict, allowed_chunk_ids: set[str]) -> list[dict]:
         changed_fields = raw_change.get("changed_fields")
         if not isinstance(changed_fields, list) or not changed_fields:
@@ -212,6 +225,8 @@ class ExtractionService:
         for change in changed_fields:
             if not isinstance(change, dict) or "field" not in change or "after" not in change:
                 raise ValueError("Each changed field requires field and after")
+            if change["field"] not in STATE_FIELDS:
+                raise ValueError(f"Invalid changed field from LLM: {change['field']}")
             change["source_chunk_ids"] = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
         return changed_fields
 
@@ -226,7 +241,7 @@ The JSON object must use exactly these top-level keys:
       "character_id": "confirmed character_id copied exactly from confirmed_characters",
       "chapter_index": 1,
       "event_summary": "brief event grounded in the chapter text",
-      "event_type": "identity|motivation|relationship|appearance|personality|encounter|decision|other",
+      "event_type": "appearance|identity|relationship|motivation|other",
       "is_long_term_change": false,
       "affected_fields": ["motivation"],
       "source_chunk_ids": ["chunk UUID copied exactly from chunks"],
@@ -259,7 +274,9 @@ Rules:
 - Every event, state_change, and changed_field must include non-empty source_chunk_ids.
 - source_chunk_ids must be copied exactly from the provided chunks for the current chapter.
 - If there is no supported event or long-term state change, output empty arrays.
-- Do not create state_changes for temporary emotions, poses, location changes, one-off dialogue, or momentary scene lighting.
+- Use event_type other for discoveries, actions, battles, and dialogue.
+- Use event_type motivation only when evidence supports a motivation change.
+- Do not create state_changes for temporary states, poses, scene movement, one-off dialogue, or momentary lighting.
 - Do not invent facts that are not supported by source chunks.
 """.strip()
 
