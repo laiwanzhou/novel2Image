@@ -374,9 +374,14 @@ export function NovelWorkspacePage() {
       </div>
 
       <div className="panel workspace-wide">
-        <h2>原文文件</h2>
+        <h2>原文文件（Operator 爬取预览）</h2>
+        <p className="empty">
+          这里显示的是只读的爬取预览文件来源，不是当前输入 novel_id 的数据库原文。
+        </p>
         {crawledPreview ? (
           <dl>
+            <dt>数据来源</dt>
+            <dd>Sample/Crawled Preview（独立于当前数据库 novel）</dd>
             <dt>novel.md</dt>
             <dd>{crawledPreview.novel_md_path}</dd>
             <dt>manifest.json</dt>
@@ -479,12 +484,16 @@ export function NovelWorkspacePage() {
       </aside>
 
       <div className="panel workspace-card">
-        <h2>原文预览</h2>
+        <h2>原文预览（Sample/Crawled Preview）</h2>
         {crawledPreview ? (
           <>
+            <p className="empty">
+              此区块来自 `/operator/crawled-novel-preview`，用于检查爬取文件格式；它不随上方 novel_id 切换。
+              当前数据库小说请以上方“章节与处理状态”为准。
+            </p>
             <div className="summary-grid compact-summary">
               <Summary label="书名" value={crawledPreview.title} />
-              <Summary label="章节数" value={crawledPreview.chapter_count} />
+              <Summary label="预览章节数" value={crawledPreview.chapter_count} />
             </div>
             <label>
               选择原文章节
