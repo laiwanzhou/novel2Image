@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 import uuid
 
 from app.core.enums import ReviewStatus
-from app.models.state import CharacterState
+from app.models.state import CharacterEvent, CharacterState, CharacterStateChange
 from app.repositories.states import StateRepository
 from app.schemas.review_schema import CharacterStateFields
 
@@ -137,6 +137,48 @@ class StateService:
             self._assert_no_confirmed_overlap(candidate.character_id)
             return candidate
 
+    def confirm_event(self, event_id: uuid.UUID, reviewer: str, note: str | None = None) -> CharacterEvent:
+        event = self.repository.get_event(event_id)
+        if event is None:
+            raise ValueError(f"CharacterEvent not found: {event_id}")
+        self._mark_reviewed(event, ReviewStatus.CONFIRMED.value, reviewer, note)
+        self.repository.session.flush()
+        return event
+
+    def reject_event(self, event_id: uuid.UUID, reviewer: str, note: str | None = None) -> CharacterEvent:
+        event = self.repository.get_event(event_id)
+        if event is None:
+            raise ValueError(f"CharacterEvent not found: {event_id}")
+        self._mark_reviewed(event, ReviewStatus.REJECTED.value, reviewer, note)
+        self.repository.session.flush()
+        return event
+
+    def confirm_state_change(
+        self,
+        state_change_id: uuid.UUID,
+        reviewer: str,
+        note: str | None = None,
+    ) -> CharacterStateChange:
+        state_change = self.repository.get_state_change(state_change_id)
+        if state_change is None:
+            raise ValueError(f"CharacterStateChange not found: {state_change_id}")
+        self._mark_reviewed(state_change, ReviewStatus.CONFIRMED.value, reviewer, note)
+        self.repository.session.flush()
+        return state_change
+
+    def reject_state_change(
+        self,
+        state_change_id: uuid.UUID,
+        reviewer: str,
+        note: str | None = None,
+    ) -> CharacterStateChange:
+        state_change = self.repository.get_state_change(state_change_id)
+        if state_change is None:
+            raise ValueError(f"CharacterStateChange not found: {state_change_id}")
+        self._mark_reviewed(state_change, ReviewStatus.REJECTED.value, reviewer, note)
+        self.repository.session.flush()
+        return state_change
+
     def _validate_change_after(self, field: str, after) -> None:
         if field not in STATE_FIELDS:
             raise ValueError(f"Unsupported CharacterState field change: {field}")
@@ -146,6 +188,14 @@ class StateService:
             return
         if after is not None and not isinstance(after, str):
             raise ValueError(f"{field} change must be a string or null")
+
+    def _mark_reviewed(self, target, status: str, reviewer: str, note: str | None) -> None:
+        if target.status != ReviewStatus.CANDIDATE.value:
+            raise ValueError("Only candidate records can be reviewed")
+        target.status = status
+        target.reviewed_at = datetime.now(UTC)
+        target.reviewed_by = reviewer
+        target.review_note = note
 
     def _assert_no_confirmed_overlap(self, character_id: uuid.UUID) -> None:
         states = self.repository.confirmed_states_for_character(character_id)

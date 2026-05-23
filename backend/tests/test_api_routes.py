@@ -104,6 +104,154 @@ def test_review_routes_list_accept_reject_and_confirm_alias(pg_session: Session)
     assert rejected_response.json()["status"] == ReviewStatus.REJECTED.value
 
 
+def test_review_routes_list_accept_and_reject_event_candidates(pg_session: Session) -> None:
+    fixture = _create_api_fixture(pg_session, include_confirmed_state=True)
+    event = CharacterEvent(
+        novel_id=fixture.novel.id,
+        character_id=fixture.character.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=1,
+        event_summary="Lin Qing decides to enter the courtyard.",
+        event_type="motivation",
+        is_long_term_change=True,
+        affected_fields=["motivation"],
+        source_chunk_ids=[str(fixture.chunk.id)],
+        confidence=0.82,
+        explanation="The chapter states the decision directly.",
+        status=ReviewStatus.CANDIDATE.value,
+    )
+    rejected_event = CharacterEvent(
+        novel_id=fixture.novel.id,
+        character_id=fixture.character.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=1,
+        event_summary="Temporary mood.",
+        event_type="other",
+        is_long_term_change=False,
+        affected_fields=[],
+        source_chunk_ids=[str(fixture.chunk.id)],
+        status=ReviewStatus.CANDIDATE.value,
+    )
+    pg_session.add_all([event, rejected_event])
+    pg_session.commit()
+    client = _client(pg_session)
+
+    listed = client.get(f"/review/events?novel_id={fixture.novel.id}&chapter_id={fixture.chapter.id}&status=candidate")
+
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert {item["id"] for item in payload} == {str(event.id), str(rejected_event.id)}
+    first = next(item for item in payload if item["id"] == str(event.id))
+    assert first["character_name"] == "Lin Qing"
+    assert first["chapter_index"] == 1
+    assert first["event_summary"] == "Lin Qing decides to enter the courtyard."
+    assert first["event_type"] == "motivation"
+    assert first["is_long_term_change"] is True
+    assert first["affected_fields"] == ["motivation"]
+    assert first["source_chunk_ids"] == [str(fixture.chunk.id)]
+    assert first["confidence"] == 0.82
+    assert first["explanation"] == "The chapter states the decision directly."
+    assert first["status"] == ReviewStatus.CANDIDATE.value
+
+    accepted = client.post(f"/review/events/{event.id}/accept", json={"reviewer": "api", "note": "looks durable"})
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == ReviewStatus.CONFIRMED.value
+    assert accepted.json()["reviewed_by"] == "api"
+    assert accepted.json()["review_note"] == "looks durable"
+
+    rejected = client.post(f"/review/events/{rejected_event.id}/reject", json={"reviewer": "api", "note": "too small"})
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == ReviewStatus.REJECTED.value
+    assert rejected.json()["review_note"] == "too small"
+
+
+def test_review_routes_list_accept_and_reject_state_change_candidates(pg_session: Session) -> None:
+    fixture = _create_api_fixture(pg_session, include_confirmed_state=True)
+    event = CharacterEvent(
+        novel_id=fixture.novel.id,
+        character_id=fixture.character.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=1,
+        event_summary="Lin Qing is promoted.",
+        event_type="identity",
+        is_long_term_change=True,
+        affected_fields=["identity"],
+        source_chunk_ids=[str(fixture.chunk.id)],
+        status=ReviewStatus.CANDIDATE.value,
+    )
+    pg_session.add(event)
+    pg_session.flush()
+    change = CharacterStateChange(
+        novel_id=fixture.novel.id,
+        character_id=fixture.character.id,
+        event_id=event.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=1,
+        changed_fields=[
+            {
+                "field": "identity",
+                "before": "outer disciple",
+                "after": "inner disciple",
+                "source_chunk_ids": [str(fixture.chunk.id)],
+            }
+        ],
+        source_chunk_ids=[str(fixture.chunk.id)],
+        confidence=0.77,
+        explanation="Promotion is explicitly described.",
+        status=ReviewStatus.CANDIDATE.value,
+    )
+    rejected_change = CharacterStateChange(
+        novel_id=fixture.novel.id,
+        character_id=fixture.character.id,
+        event_id=event.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=1,
+        changed_fields=[
+            {
+                "field": "personality",
+                "before": "quiet",
+                "after": "temporarily angry",
+                "source_chunk_ids": [str(fixture.chunk.id)],
+            }
+        ],
+        source_chunk_ids=[str(fixture.chunk.id)],
+        status=ReviewStatus.CANDIDATE.value,
+    )
+    pg_session.add_all([change, rejected_change])
+    pg_session.commit()
+    client = _client(pg_session)
+
+    listed = client.get(
+        f"/review/state-changes?novel_id={fixture.novel.id}&character_id={fixture.character.id}&status=candidate"
+    )
+
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert {item["id"] for item in payload} == {str(change.id), str(rejected_change.id)}
+    first = next(item for item in payload if item["id"] == str(change.id))
+    assert first["character_name"] == "Lin Qing"
+    assert first["event_id"] == str(event.id)
+    assert first["chapter_index"] == 1
+    assert first["changed_fields"][0]["field"] == "identity"
+    assert first["source_chunk_ids"] == [str(fixture.chunk.id)]
+    assert first["confidence"] == 0.77
+    assert first["explanation"] == "Promotion is explicitly described."
+    assert first["status"] == ReviewStatus.CANDIDATE.value
+
+    accepted = client.post(f"/review/state-changes/{change.id}/accept", json={"reviewer": "api", "note": "supported"})
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == ReviewStatus.CONFIRMED.value
+    assert accepted.json()["reviewed_by"] == "api"
+
+    rejected = client.post(
+        f"/review/state-changes/{rejected_change.id}/reject",
+        json={"reviewer": "api", "note": "temporary"},
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == ReviewStatus.REJECTED.value
+    assert rejected.json()["review_note"] == "temporary"
+
+
 def test_state_routes_create_initial_state_and_list_history(pg_session: Session) -> None:
     fixture = _create_api_fixture(pg_session, include_confirmed_state=False)
     fixture.character.status = ReviewStatus.CONFIRMED.value

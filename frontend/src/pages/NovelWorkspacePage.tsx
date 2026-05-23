@@ -1,6 +1,8 @@
 import { useState } from "react";
 import {
+  acceptEventCandidate,
   acceptCandidate,
+  acceptStateChangeCandidate,
   Candidate,
   ChapterSummary,
   CharacterSummary,
@@ -23,13 +25,19 @@ import {
   listChapterChunks,
   listChapters,
   listCharacters,
+  listEventCandidates,
   listPromptHistory,
+  listStateChangeCandidates,
   listStates,
   NovelSummary,
   ProcessingStatus,
   CrawledNovelPreview,
+  EventCandidate,
   PromptGeneration,
+  rejectEventCandidate,
   rejectCandidate,
+  rejectStateChangeCandidate,
+  StateChangeCandidate,
 } from "../api";
 
 export function NovelWorkspacePage() {
@@ -45,6 +53,8 @@ export function NovelWorkspacePage() {
   const [states, setStates] = useState<CharacterState[]>([]);
   const [selectedState, setSelectedState] = useState<CharacterState | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<Candidate | null>(null);
+  const [eventCandidates, setEventCandidates] = useState<EventCandidate[]>([]);
+  const [stateChangeCandidates, setStateChangeCandidates] = useState<StateChangeCandidate[]>([]);
   const [prompts, setPrompts] = useState<PromptGeneration[]>([]);
   const [selectedPrompt, setSelectedPrompt] = useState<PromptGeneration | null>(null);
   const [crawledPreview, setCrawledPreview] = useState<CrawledNovelPreview | null>(null);
@@ -129,6 +139,7 @@ export function NovelWorkspacePage() {
       } else {
         setChunks([]);
       }
+      await loadKnowledgeReviewCandidates(id, nextChapter?.id);
       setMessage("工作台已加载。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "请求失败。");
@@ -143,6 +154,7 @@ export function NovelWorkspacePage() {
     setMessage("");
     try {
       setChunks(await listChapterChunks(chapter.id));
+      await loadKnowledgeReviewCandidates(novelId.trim(), chapter.id);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "请求失败。");
     } finally {
@@ -172,6 +184,7 @@ export function NovelWorkspacePage() {
       const candidateResult = await listCandidates(id);
       setCandidates(candidateResult);
       setSelectedCandidate(candidateResult[0] ?? null);
+      await loadKnowledgeReviewCandidates(id, currentChapter?.id);
     }
     if (options.refreshPrompts) {
       const promptResult = await listPromptHistory(id);
@@ -204,6 +217,14 @@ export function NovelWorkspacePage() {
     const items = await listStates(characterId);
     setStates(items);
     setSelectedState(items[0] ?? null);
+  }
+
+  async function loadKnowledgeReviewCandidates(id = novelId.trim(), chapterId = selectedChapter?.id) {
+    if (!id) return;
+    const filters = chapterId ? { chapter_id: chapterId, status: "candidate" } : { status: "candidate" };
+    const [events, changes] = await Promise.all([listEventCandidates(id, filters), listStateChangeCandidates(id, filters)]);
+    setEventCandidates(events);
+    setStateChangeCandidates(changes);
   }
 
   async function selectCharacter(characterId: string) {
@@ -242,6 +263,28 @@ export function NovelWorkspacePage() {
     if (!selectedChapter) return;
     await runAction("单章抽取已完成。", async () => {
       await extractChapter(selectedChapter.id);
+      await refreshWorkspaceParts({ refreshCandidates: true });
+    });
+  }
+
+  async function reviewEventCandidate(candidate: EventCandidate, action: "accept" | "reject") {
+    await runAction("事件候选审核已保存。", async () => {
+      if (action === "accept") {
+        await acceptEventCandidate(candidate.id, reviewer, reviewNote);
+      } else {
+        await rejectEventCandidate(candidate.id, reviewer, reviewNote);
+      }
+      await refreshWorkspaceParts({ refreshCandidates: true });
+    });
+  }
+
+  async function reviewStateChangeCandidate(candidate: StateChangeCandidate, action: "accept" | "reject") {
+    await runAction("状态变更候选审核已保存。", async () => {
+      if (action === "accept") {
+        await acceptStateChangeCandidate(candidate.id, reviewer, reviewNote);
+      } else {
+        await rejectStateChangeCandidate(candidate.id, reviewer, reviewNote);
+      }
       await refreshWorkspaceParts({ refreshCandidates: true });
     });
   }
@@ -599,6 +642,91 @@ export function NovelWorkspacePage() {
             废弃
           </button>
         </div>
+        <h3>事件候选</h3>
+        <p className="empty">当前章节已加载 {eventCandidates.length} 条 CharacterEvent candidate。</p>
+        <table>
+          <thead>
+            <tr>
+              <th>角色</th>
+              <th>章节</th>
+              <th>类型</th>
+              <th>长期变化</th>
+              <th>摘要</th>
+              <th>置信度</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {eventCandidates.map((candidate) => (
+              <tr key={candidate.id}>
+                <td>{candidate.character_name ?? candidate.character_id ?? "-"}</td>
+                <td>{candidate.chapter_index}</td>
+                <td>{candidate.event_type}</td>
+                <td>{candidate.is_long_term_change ? "是" : "否"}</td>
+                <td>
+                  <strong>{candidate.event_summary}</strong>
+                  <p>{candidate.explanation ?? "-"}</p>
+                  <p>影响字段：{candidate.affected_fields.join(", ") || "-"}</p>
+                  <details>
+                    <summary>source_chunk_ids</summary>
+                    <pre>{candidate.source_chunk_ids.join("\n")}</pre>
+                  </details>
+                </td>
+                <td>{candidate.confidence ?? "-"}</td>
+                <td>
+                  <div className="button-row">
+                    <button onClick={() => reviewEventCandidate(candidate, "accept")} disabled={loading}>
+                      接受
+                    </button>
+                    <button onClick={() => reviewEventCandidate(candidate, "reject")} disabled={loading}>
+                      废弃
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <h3>状态变更候选</h3>
+        <p className="empty">当前章节已加载 {stateChangeCandidates.length} 条 CharacterStateChange candidate。</p>
+        <table>
+          <thead>
+            <tr>
+              <th>角色</th>
+              <th>章节</th>
+              <th>字段变更</th>
+              <th>置信度</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stateChangeCandidates.map((candidate) => (
+              <tr key={candidate.id}>
+                <td>{candidate.character_name ?? candidate.character_id ?? "-"}</td>
+                <td>{candidate.chapter_index}</td>
+                <td>
+                  <pre>{JSON.stringify(candidate.changed_fields, null, 2)}</pre>
+                  <p>{candidate.explanation ?? "-"}</p>
+                  <details>
+                    <summary>source_chunk_ids</summary>
+                    <pre>{candidate.source_chunk_ids.join("\n")}</pre>
+                  </details>
+                </td>
+                <td>{candidate.confidence ?? "-"}</td>
+                <td>
+                  <div className="button-row">
+                    <button onClick={() => reviewStateChangeCandidate(candidate, "accept")} disabled={loading}>
+                      接受
+                    </button>
+                    <button onClick={() => reviewStateChangeCandidate(candidate, "reject")} disabled={loading}>
+                      废弃
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
         <h3>手动创建角色</h3>
         <div className="form-grid compact">
           <label>

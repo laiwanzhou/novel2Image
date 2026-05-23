@@ -38,6 +38,46 @@ class StateRepository(BaseRepository[CharacterState]):
         events = {event.id: event for event in self.session.scalars(statement)}
         return [events[event_id] for event_id in event_ids if event_id in events]
 
+    def list_events(
+        self,
+        *,
+        novel_id: uuid.UUID,
+        chapter_id: uuid.UUID | None = None,
+        character_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> list[CharacterEvent]:
+        statement = select(CharacterEvent).where(CharacterEvent.novel_id == novel_id)
+        if chapter_id is not None:
+            statement = statement.where(CharacterEvent.chapter_id == chapter_id)
+        if character_id is not None:
+            statement = statement.where(CharacterEvent.character_id == character_id)
+        if status is not None:
+            statement = statement.where(CharacterEvent.status == status)
+        statement = statement.order_by(CharacterEvent.chapter_index, CharacterEvent.created_at, CharacterEvent.id)
+        return list(self.session.scalars(statement))
+
+    def list_state_changes(
+        self,
+        *,
+        novel_id: uuid.UUID,
+        chapter_id: uuid.UUID | None = None,
+        character_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> list[CharacterStateChange]:
+        statement = select(CharacterStateChange).where(CharacterStateChange.novel_id == novel_id)
+        if chapter_id is not None:
+            statement = statement.where(CharacterStateChange.chapter_id == chapter_id)
+        if character_id is not None:
+            statement = statement.where(CharacterStateChange.character_id == character_id)
+        if status is not None:
+            statement = statement.where(CharacterStateChange.status == status)
+        statement = statement.order_by(
+            CharacterStateChange.chapter_index,
+            CharacterStateChange.created_at,
+            CharacterStateChange.id,
+        )
+        return list(self.session.scalars(statement))
+
     def latest_confirmed_state_before_or_at(self, character_id: uuid.UUID, chapter_index: int) -> CharacterState | None:
         statement = (
             select(CharacterState)

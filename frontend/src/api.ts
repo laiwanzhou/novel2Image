@@ -13,6 +13,44 @@ export type Candidate = {
   review_note?: string | null;
 };
 
+export type EventCandidate = {
+  id: string;
+  novel_id: string;
+  character_id: string | null;
+  character_name: string | null;
+  chapter_id: string;
+  chapter_index: number;
+  event_summary: string;
+  event_type: string;
+  is_long_term_change: boolean;
+  affected_fields: string[];
+  source_chunk_ids: string[];
+  confidence: number | null;
+  explanation: string | null;
+  status: string;
+  reviewed_at?: string | null;
+  reviewed_by?: string | null;
+  review_note?: string | null;
+};
+
+export type StateChangeCandidate = {
+  id: string;
+  novel_id: string;
+  character_id: string | null;
+  character_name: string | null;
+  event_id: string | null;
+  chapter_id: string;
+  chapter_index: number;
+  changed_fields: Array<Record<string, unknown>>;
+  source_chunk_ids: string[];
+  confidence: number | null;
+  explanation: string | null;
+  status: string;
+  reviewed_at?: string | null;
+  reviewed_by?: string | null;
+  review_note?: string | null;
+};
+
 export type CharacterState = {
   id: string;
   novel_id: string;
@@ -254,6 +292,54 @@ export function extractChapter(chapterId: string): Promise<ExtractChapterResult>
 
 export function listCandidates(novelId: string): Promise<Candidate[]> {
   return request<Candidate[]>(`/review/candidates?novel_id=${encodeURIComponent(novelId)}`);
+}
+
+export function listEventCandidates(
+  novelId: string,
+  filters: { chapter_id?: string; character_id?: string; status?: string } = {},
+): Promise<EventCandidate[]> {
+  const params = new URLSearchParams({ novel_id: novelId, status: filters.status ?? "candidate" });
+  if (filters.chapter_id) params.set("chapter_id", filters.chapter_id);
+  if (filters.character_id) params.set("character_id", filters.character_id);
+  return request<EventCandidate[]>(`/review/events?${params.toString()}`);
+}
+
+export function acceptEventCandidate(id: string, reviewer: string, note?: string): Promise<EventCandidate> {
+  return request<EventCandidate>(`/review/events/${encodeURIComponent(id)}/accept`, {
+    method: "POST",
+    body: JSON.stringify({ reviewer, note: note || null }),
+  });
+}
+
+export function rejectEventCandidate(id: string, reviewer: string, note?: string): Promise<EventCandidate> {
+  return request<EventCandidate>(`/review/events/${encodeURIComponent(id)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reviewer, note: note || null }),
+  });
+}
+
+export function listStateChangeCandidates(
+  novelId: string,
+  filters: { chapter_id?: string; character_id?: string; status?: string } = {},
+): Promise<StateChangeCandidate[]> {
+  const params = new URLSearchParams({ novel_id: novelId, status: filters.status ?? "candidate" });
+  if (filters.chapter_id) params.set("chapter_id", filters.chapter_id);
+  if (filters.character_id) params.set("character_id", filters.character_id);
+  return request<StateChangeCandidate[]>(`/review/state-changes?${params.toString()}`);
+}
+
+export function acceptStateChangeCandidate(id: string, reviewer: string, note?: string): Promise<StateChangeCandidate> {
+  return request<StateChangeCandidate>(`/review/state-changes/${encodeURIComponent(id)}/accept`, {
+    method: "POST",
+    body: JSON.stringify({ reviewer, note: note || null }),
+  });
+}
+
+export function rejectStateChangeCandidate(id: string, reviewer: string, note?: string): Promise<StateChangeCandidate> {
+  return request<StateChangeCandidate>(`/review/state-changes/${encodeURIComponent(id)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reviewer, note: note || null }),
+  });
 }
 
 export function acceptCandidate(targetType: string, id: string, reviewer: string, note?: string): Promise<Candidate> {
