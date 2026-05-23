@@ -29,6 +29,69 @@ def test_markdown_import_removes_heading_marks(tmp_path: Path) -> None:
     assert manifest.chapters[0].source_path == str(path)
 
 
+def test_markdown_import_ignores_duplicate_leading_chapter_title_variant() -> None:
+    text = """# 第24章 【帝国军方与诺曼帕萨特】
+
+第24章 【帝国军方与诺曼·帕萨特】
+
+正文第一段。
+"""
+
+    chapters = ImportService().parse_chapters(text)
+
+    assert len(chapters) == 1
+    assert chapters[0].chapter_index == 24
+    assert chapters[0].title == "第24章 【帝国军方与诺曼帕萨特】"
+    assert "第24章 【帝国军方与诺曼·帕萨特】" not in chapters[0].content
+    assert chapters[0].content == "正文第一段。"
+    assert chapters[0].word_count > 0
+
+
+def test_markdown_import_still_splits_normal_consecutive_chapters() -> None:
+    text = """# 第1章 初见
+
+正文一。
+
+# 第2章 转折
+
+正文二。
+"""
+
+    chapters = ImportService().parse_chapters(text)
+
+    assert len(chapters) == 2
+    assert [chapter.title for chapter in chapters] == ["第1章 初见", "第2章 转折"]
+    assert [chapter.content for chapter in chapters] == ["正文一。", "正文二。"]
+
+
+def test_import_does_not_split_inline_sentence_that_mentions_chapter_number() -> None:
+    text = """# 第1章 初见
+
+他说第24章的故事并没有结束，只是正文中的一句话。
+"""
+
+    chapters = ImportService().parse_chapters(text)
+
+    assert len(chapters) == 1
+    assert chapters[0].content == "他说第24章的故事并没有结束，只是正文中的一句话。"
+
+
+def test_txt_import_ignores_duplicate_leading_chapter_title_variant() -> None:
+    text = """第24章 【帝国军方与诺曼帕萨特】
+
+第24章 【帝国军方与诺曼·帕萨特】
+
+正文第一段。
+"""
+
+    chapters = ImportService().parse_chapters(text)
+
+    assert len(chapters) == 1
+    assert chapters[0].chapter_index == 24
+    assert chapters[0].title == "第24章 【帝国军方与诺曼帕萨特】"
+    assert chapters[0].content == "正文第一段。"
+
+
 def test_import_without_chapter_heading_creates_single_chapter(tmp_path: Path) -> None:
     path = tmp_path / "single.txt"
     path.write_text("没有章节标题的正文", encoding="utf-8")
