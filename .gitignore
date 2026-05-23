@@ -22,7 +22,9 @@ dist/
 
 # Local environment and secrets
 .env
+backend/.env
 .env.*
+*.env.local
 !.env.example
 
 # Logs, backups, and temporary files

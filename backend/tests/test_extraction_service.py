@@ -409,6 +409,10 @@ def test_extraction_prompt_includes_confirmed_character_ids(pg_session: Session)
     assert str(fixture.character.id) in user_prompt
     assert "Lin Qing" in user_prompt
     assert "confirmed_characters" in user_prompt
+    assert "Return only a valid JSON object" in user_prompt
+    assert '"events"' in user_prompt
+    assert '"state_changes"' in user_prompt
+    assert "Do not return empty content" in user_prompt
     system_prompt = provider.calls[0][0]
     assert "json" in system_prompt.lower()
     assert '"events"' in system_prompt

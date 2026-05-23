@@ -8,7 +8,7 @@ from app.repositories.base import BaseRepository
 
 
 def test_settings_have_required_provider_names() -> None:
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     assert settings.embedding_provider == "fake"
     assert settings.llm_provider == "fake"

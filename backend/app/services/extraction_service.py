@@ -309,4 +309,9 @@ Rules:
                 for chunk in chunks
             ],
         }
-        return json.dumps(payload, ensure_ascii=False)
+        return (
+            "Return only a valid JSON object with exactly the top-level keys "
+            '"events" and "state_changes". Do not return empty content. '
+            "Use the following chapter payload as evidence:\n"
+            f"{json.dumps(payload, ensure_ascii=False)}"
+        )
