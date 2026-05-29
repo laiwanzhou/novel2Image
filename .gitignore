@@ -30,6 +30,7 @@ backend/.env
 # Logs, backups, and temporary files
 logs/
 *.log
+backend/.pipeline-runs/
 bak/
 tmp/
 temp/
