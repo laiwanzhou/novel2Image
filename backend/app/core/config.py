@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 4096
     llm_timeout_seconds: float = 180.0
     extraction_auto_confirm_events: bool = False
+    llm_review_enabled: bool = False
+    llm_review_auto_apply: bool = False
+    llm_review_confidence_threshold: float = 0.85
 
     model_config = SettingsConfigDict(
         env_file=".env",

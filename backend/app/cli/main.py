@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -19,7 +20,9 @@ from app.services.embedding_service import EmbeddingService
 from app.services.evidence_service import EvidenceService
 from app.services.extraction_service import ExtractionService
 from app.services.import_service import ImportService
+from app.services.llm_review_service import LlmReviewService
 from app.services.prompt_generation_service import PromptGenerationService
+from app.services.state_service import StateService
 
 
 app = typer.Typer(help="Novel character visualization MVP CLI.")
@@ -118,6 +121,56 @@ def extract_chapter(
         typer.echo(f"created {len(result.events)} event candidates and {len(result.state_changes)} state change candidates")
 
 
+@app.command("review-state-change")
+def review_state_change(
+    state_change_id: UUID = typer.Option(...),
+    llm_review: bool = typer.Option(False, "--llm-review", help="Run LLM reviewer for this state_change candidate."),
+    apply: bool | None = typer.Option(None, "--apply/--dry-run", help="Apply high-confidence confirm/reject decisions."),
+    confidence_threshold: float | None = typer.Option(None),
+) -> None:
+    settings = get_settings()
+    if not llm_review and not settings.llm_review_enabled:
+        raise typer.BadParameter("Pass --llm-review or set NOVEL_VIS_LLM_REVIEW_ENABLED=true")
+    auto_apply = settings.llm_review_auto_apply if apply is None else apply
+    threshold = settings.llm_review_confidence_threshold if confidence_threshold is None else confidence_threshold
+    with SessionLocal() as session:
+        decision = _llm_review_service(session, settings).review_state_change_candidate(
+            state_change_id,
+            auto_apply=auto_apply,
+            confidence_threshold=threshold,
+        )
+        session.commit()
+        typer.echo(json.dumps(_decision_payload(decision), ensure_ascii=False))
+
+
+@app.command("review-state-changes")
+def review_state_changes(
+    novel_id: UUID = typer.Option(...),
+    chapter_id: UUID | None = typer.Option(None),
+    character_id: UUID | None = typer.Option(None),
+    llm_review: bool = typer.Option(False, "--llm-review", help="Run LLM reviewer for state_change candidates."),
+    apply: bool | None = typer.Option(None, "--apply/--dry-run", help="Apply high-confidence confirm/reject decisions."),
+    limit: int | None = typer.Option(None),
+    confidence_threshold: float | None = typer.Option(None),
+) -> None:
+    settings = get_settings()
+    if not llm_review and not settings.llm_review_enabled:
+        raise typer.BadParameter("Pass --llm-review or set NOVEL_VIS_LLM_REVIEW_ENABLED=true")
+    auto_apply = settings.llm_review_auto_apply if apply is None else apply
+    threshold = settings.llm_review_confidence_threshold if confidence_threshold is None else confidence_threshold
+    with SessionLocal() as session:
+        decisions = _llm_review_service(session, settings).batch_review_state_changes(
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            character_id=character_id,
+            auto_apply=auto_apply,
+            limit=limit,
+            confidence_threshold=threshold,
+        )
+        session.commit()
+        typer.echo(json.dumps([_decision_payload(decision) for decision in decisions], ensure_ascii=False))
+
+
 @app.command("generate-prompt")
 def generate_prompt(
     novel_id: UUID = typer.Option(...),
@@ -144,6 +197,37 @@ def generate_prompt(
         )
         session.commit()
         typer.echo(str(prompt.id))
+
+
+def _llm_review_service(session, settings) -> LlmReviewService:
+    state_repository = StateRepository(session)
+    return LlmReviewService(
+        state_repository=state_repository,
+        chunk_repository=ChunkRepository(session),
+        character_repository=CharacterRepository(session),
+        state_service=StateService(state_repository),
+        llm_provider=get_llm_provider(
+            settings.llm_provider,
+            api_base=settings.llm_api_base,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            json_mode=settings.llm_json_mode,
+            max_tokens=settings.llm_max_tokens,
+            timeout_seconds=settings.llm_timeout_seconds,
+        ),
+    )
+
+
+def _decision_payload(decision) -> dict:
+    return {
+        "target_type": decision.target_type,
+        "target_id": str(decision.target_id),
+        "decision": decision.decision,
+        "confidence": decision.confidence,
+        "reason": decision.reason,
+        "risk_flags": decision.risk_flags,
+        "applied": decision.applied,
+    }
 
 
 @app.command("list-character-candidates")

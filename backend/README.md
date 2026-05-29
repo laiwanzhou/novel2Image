@@ -62,6 +62,9 @@ NOVEL_VIS_LLM_JSON_MODE=true
 NOVEL_VIS_LLM_MAX_TOKENS=4096
 NOVEL_VIS_LLM_TIMEOUT_SECONDS=180
 NOVEL_VIS_EXTRACTION_AUTO_CONFIRM_EVENTS=false
+NOVEL_VIS_LLM_REVIEW_ENABLED=false
+NOVEL_VIS_LLM_REVIEW_AUTO_APPLY=false
+NOVEL_VIS_LLM_REVIEW_CONFIDENCE_THRESHOLD=0.85
 ```
 
 Copy the root `.env.example` to `.env` for local overrides. Do not commit `.env`.
@@ -228,6 +231,47 @@ Common extraction errors:
 - Model references chunks outside the selected chapter.
 - Model references a character that has not been confirmed yet.
 - Model returns an unsupported `event_type` such as `decision` or `encounter`; this is rejected before persistence to protect the review data, not a database failure.
+
+### LLM Review For State Changes
+
+`CharacterEvent` can be auto-confirmed as an audit log, but `CharacterStateChange` still enters review. To reduce manual review load, run a second LLM pass over state-change candidates:
+
+```powershell
+.\.venv\Scripts\python -m app.cli.main review-state-change `
+  --state-change-id <state_change_id> `
+  --llm-review
+
+.\.venv\Scripts\python -m app.cli.main review-state-changes `
+  --novel-id <novel_id> `
+  --chapter-id <chapter_id> `
+  --llm-review `
+  --limit 5
+```
+
+By default this is a dry run: it prints `confirm`, `reject`, or `needs_human` plus confidence and risk flags, but does not modify the database. Add `--apply` to automatically apply only high-confidence `confirm` / `reject` decisions:
+
+```powershell
+.\.venv\Scripts\python -m app.cli.main review-state-changes `
+  --novel-id <novel_id> `
+  --chapter-id <chapter_id> `
+  --llm-review `
+  --apply `
+  --confidence-threshold 0.85
+```
+
+Config defaults:
+
+- `NOVEL_VIS_LLM_REVIEW_ENABLED=false`
+- `NOVEL_VIS_LLM_REVIEW_AUTO_APPLY=false`
+- `NOVEL_VIS_LLM_REVIEW_CONFIDENCE_THRESHOLD=0.85`
+
+Rules:
+
+- `needs_human` is never auto-applied.
+- Low-confidence decisions remain `candidate`.
+- Applied decisions use reviewer `llm-reviewer` and write decision details into `review_note`.
+- LLM review does not synthesize `CharacterState`.
+- LLM review does not confirm `CharacterState`.
 
 Review character candidates:
 

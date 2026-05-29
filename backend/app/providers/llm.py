@@ -12,6 +12,9 @@ class LlmProvider(Protocol):
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         ...
 
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        ...
+
 
 class FakeLlmProvider:
     """Deterministic structured-output provider for tests and local development."""
@@ -21,6 +24,10 @@ class FakeLlmProvider:
         self.calls: list[tuple[str, str]] = []
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        self.calls.append((system_prompt, user_prompt))
+        return self.response
+
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         self.calls.append((system_prompt, user_prompt))
         return self.response
 
@@ -57,6 +64,14 @@ class FastGptLlmProvider:
         self._post_json = post_json or self._httpx_post_json
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        parsed = self._generate_parsed_json(system_prompt, user_prompt)
+        self._validate_extraction_schema(parsed)
+        return parsed
+
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        return self._generate_parsed_json(system_prompt, user_prompt)
+
+    def _generate_parsed_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": [
@@ -84,9 +99,7 @@ class FastGptLlmProvider:
             raise ValueError(f"FastGPT LLM request failed: {exc}") from exc
 
         content = self._extract_message_content(response)
-        parsed = self._parse_json_content(content)
-        self._validate_extraction_schema(parsed)
-        return parsed
+        return self._parse_json_content(content)
 
     def _extract_message_content(self, response: dict[str, Any]) -> str:
         try:
