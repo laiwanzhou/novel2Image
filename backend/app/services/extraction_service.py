@@ -112,6 +112,10 @@ class ExtractionService:
             source_chunk_ids = self._require_source_chunks(raw_change, "state_change", allowed_chunk_ids)
             character = self._require_confirmed_character(raw_change.get("character_id"))
             event_index = self._validated_event_index(raw_change, event_drafts)
+            if event_index is None:
+                raise ValueError("state_change requires event_index referencing a long-term event")
+            if not event_drafts[event_index].is_long_term_change:
+                raise ValueError("state_change event_index must reference an event with is_long_term_change=true")
             changed_fields = self._require_changed_fields(raw_change, allowed_chunk_ids)
             state_change_drafts.append(
                 StateChangeDraft(
@@ -120,7 +124,7 @@ class ExtractionService:
                     changed_fields=changed_fields,
                     source_chunk_ids=source_chunk_ids,
                     confidence=raw_change.get("confidence"),
-                    explanation=raw_change.get("explanation"),
+                    explanation=self._require_state_change_explanation(raw_change),
                 )
             )
 
@@ -230,6 +234,12 @@ class ExtractionService:
             change["source_chunk_ids"] = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
         return changed_fields
 
+    def _require_state_change_explanation(self, raw_change: dict) -> str:
+        explanation = raw_change.get("explanation")
+        if not isinstance(explanation, str) or not explanation.strip():
+            raise ValueError("state_change requires explanation describing why the change is long-term")
+        return explanation
+
     def _system_prompt(self) -> str:
         return """
 You extract auditable novel character knowledge. Return strict JSON only.
@@ -242,7 +252,7 @@ The JSON object must use exactly these top-level keys:
       "chapter_index": 1,
       "event_summary": "brief event grounded in the chapter text",
       "event_type": "appearance|identity|relationship|motivation|other",
-      "is_long_term_change": false,
+      "is_long_term_change": true,
       "affected_fields": ["motivation"],
       "source_chunk_ids": ["chunk UUID copied exactly from chunks"],
       "confidence": 0.0,
@@ -274,6 +284,12 @@ Rules:
 - Every event, state_change, and changed_field must include non-empty source_chunk_ids.
 - source_chunk_ids must be copied exactly from the provided chunks for the current chapter.
 - If there is no supported event or long-term state change, output empty arrays.
+- CharacterEvent can describe ordinary plot events, but CharacterStateChange is only for durable changes that should affect later chapters.
+- Every state_change must set event_index to a related event whose is_long_term_change is true.
+- If an event is not long-term, do not create a state_change for it.
+- Every state_change explanation must explain why the change is durable rather than temporary.
+- Do not create state_changes for a momentary emotion, action, pose, location, or dialogue.
+- Accepting a new name, forming a long-term partnership, or establishing a rebuilding goal can be identity, relationship, or motivation changes when source chunks support that durability.
 - Use event_type other for discoveries, actions, battles, and dialogue.
 - Use event_type motivation only when evidence supports a motivation change.
 - Do not create state_changes for temporary states, poses, scene movement, one-off dialogue, or momentary lighting.

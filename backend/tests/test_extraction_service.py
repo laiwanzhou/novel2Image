@@ -365,10 +365,21 @@ def test_extraction_rejects_invalid_changed_field_name(pg_session: Session) -> N
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
     provider = FakeLlmProvider(
         response={
-            "events": [],
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter says this changes his identity.",
+                }
+            ],
             "state_changes": [
                 {
                     "character_id": str(fixture.character.id),
+                    "event_index": 0,
                     "changed_fields": [
                         {
                             "field": "location",
@@ -377,6 +388,7 @@ def test_extraction_rejects_invalid_changed_field_name(pg_session: Session) -> N
                         }
                     ],
                     "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "This is incorrectly treated as a state field.",
                 }
             ],
         }
@@ -389,6 +401,137 @@ def test_extraction_rejects_invalid_changed_field_name(pg_session: Session) -> N
     )
 
     with pytest.raises(ValueError, match="Invalid changed field from LLM: location"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_state_change_without_event_index(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter says this changes his identity.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "changed_fields": [
+                        {
+                            "field": "identity",
+                            "before": "outer disciple",
+                            "after": "inner disciple",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Identity changes for later chapters.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    with pytest.raises(ValueError, match="state_change requires event_index"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_state_change_for_non_long_term_event(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing pauses in the hall.",
+                    "event_type": "other",
+                    "is_long_term_change": False,
+                    "affected_fields": [],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "This is a momentary action.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "motivation",
+                            "before": "uncertain",
+                            "after": "determined",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The output incorrectly treats a momentary pause as durable.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    with pytest.raises(ValueError, match="is_long_term_change=true"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_state_change_without_explanation(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter says this changes his identity.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "identity",
+                            "before": "outer disciple",
+                            "after": "inner disciple",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    with pytest.raises(ValueError, match="state_change requires explanation"):
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
@@ -424,6 +567,12 @@ def test_extraction_prompt_includes_confirmed_character_ids(pg_session: Session)
     assert "decision" not in system_prompt
     assert "encounter" not in system_prompt
     assert "Use event_type other for discoveries, actions, battles, and dialogue." in system_prompt
+    assert "CharacterStateChange is only for durable changes that should affect later chapters." in system_prompt
+    assert "Every state_change must set event_index to a related event whose is_long_term_change is true." in system_prompt
+    assert "If an event is not long-term, do not create a state_change for it." in system_prompt
+    assert "momentary emotion, action, pose, location, or dialogue" in system_prompt
+    assert "Accepting a new name" in system_prompt
+    assert "forming a long-term partnership" in system_prompt
 
 
 class ExtractionFixture:
