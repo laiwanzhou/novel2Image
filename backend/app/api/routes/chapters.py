@@ -50,6 +50,7 @@ def extract_chapter(chapter_id: uuid.UUID, db: Session = Depends(get_db)) -> dic
             max_tokens=settings.llm_max_tokens,
             timeout_seconds=settings.llm_timeout_seconds,
         ),
+        auto_confirm_events=settings.extraction_auto_confirm_events,
     ).extract_chapter_candidates(chapter_id)
     chapter = ChunkRepository(db).get_chapter(chapter_id)
     if chapter is None:

@@ -1,8 +1,10 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+import app.api.routes.chapters as chapter_routes
 from app.api.deps import get_db
 from app.api.main import create_app
 from app.core.enums import PromptType, ReviewStatus
@@ -10,6 +12,7 @@ from app.models.character import Character, CharacterAlias
 from app.models.novel import Chapter, ChapterChunk, Novel
 from app.models.prompt import PromptGeneration
 from app.models.state import CharacterEvent, CharacterState, CharacterStateChange
+from app.providers.llm import FakeLlmProvider
 
 
 def test_operator_crawled_novel_preview_returns_fixed_file_summary(pg_session: Session) -> None:
@@ -694,6 +697,52 @@ def test_extract_chapter_runs_single_chapter_extraction(pg_session: Session) -> 
         "event_candidate_count": 0,
         "state_change_candidate_count": 0,
     }
+
+
+def test_extract_chapter_route_can_auto_confirm_events_from_settings(pg_session: Session, monkeypatch) -> None:
+    fixture = _create_api_fixture(pg_session, include_confirmed_state=True)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "confidence": 0.91,
+                    "explanation": "The chapter explicitly says this is durable.",
+                }
+            ],
+            "state_changes": [],
+        }
+    )
+    monkeypatch.setattr(
+        chapter_routes,
+        "get_settings",
+        lambda: SimpleNamespace(
+            llm_provider="fake",
+            llm_api_base=None,
+            llm_api_key=None,
+            llm_model=None,
+            llm_json_mode=True,
+            llm_max_tokens=4096,
+            llm_timeout_seconds=180.0,
+            extraction_auto_confirm_events=True,
+        ),
+    )
+    monkeypatch.setattr(chapter_routes, "get_llm_provider", lambda *args, **kwargs: provider)
+    client = _client(pg_session)
+
+    response = client.post(f"/chapters/{fixture.chapter.id}/extract", json={})
+
+    assert response.status_code == 200
+    assert response.json()["event_candidate_count"] == 1
+    event = pg_session.query(CharacterEvent).filter(CharacterEvent.event_summary == "Lin Qing joins the inner sect.").one()
+    assert event.status == ReviewStatus.CONFIRMED.value
+    assert event.reviewed_by == "auto-extraction"
+    assert event.reviewed_at is not None
 
 
 def test_confirm_state_route_confirms_candidate_state(pg_session: Session) -> None:

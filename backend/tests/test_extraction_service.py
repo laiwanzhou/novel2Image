@@ -72,6 +72,64 @@ def test_fake_llm_extraction_persists_candidate_event_and_state_change(pg_sessio
     assert state_change.changed_fields[0]["after"] == "inner disciple"
 
 
+def test_extraction_can_auto_confirm_events_while_state_changes_remain_candidate(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "confidence": 0.92,
+                    "explanation": "The chapter explicitly says the sect accepted him.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "identity",
+                            "before": "outer disciple",
+                            "after": "inner disciple",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "confidence": 0.9,
+                    "explanation": "Identity changes from outer disciple to inner disciple.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        auto_confirm_events=True,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    event = result.events[0]
+    state_change = result.state_changes[0]
+    assert event.status == ReviewStatus.CONFIRMED.value
+    assert event.reviewed_by == "auto-extraction"
+    assert event.review_note == "auto-confirmed after extraction validation"
+    assert event.reviewed_at is not None
+    assert state_change.status == ReviewStatus.CANDIDATE.value
+    assert state_change.reviewed_by is None
+    assert state_change.reviewed_at is None
+    assert state_change.event_id == event.id
+
+
 def test_extraction_rejects_event_without_source_chunks(pg_session: Session) -> None:
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
     provider = FakeLlmProvider(

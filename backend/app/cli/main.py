@@ -85,8 +85,18 @@ def embed_book(novel_id: UUID = typer.Option(...)) -> None:
 
 
 @app.command("extract-chapter")
-def extract_chapter(chapter_id: UUID = typer.Option(...)) -> None:
+def extract_chapter(
+    chapter_id: UUID = typer.Option(...),
+    auto_confirm_events: bool | None = typer.Option(
+        None,
+        "--auto-confirm-events/--no-auto-confirm-events",
+        help="Confirm extracted CharacterEvent records immediately; state changes remain candidates.",
+    ),
+) -> None:
     settings = get_settings()
+    should_auto_confirm_events = (
+        settings.extraction_auto_confirm_events if auto_confirm_events is None else auto_confirm_events
+    )
     llm_provider = get_llm_provider(
         settings.llm_provider,
         api_base=settings.llm_api_base,
@@ -102,6 +112,7 @@ def extract_chapter(chapter_id: UUID = typer.Option(...)) -> None:
             chunk_repository=ChunkRepository(session),
             character_repository=CharacterRepository(session),
             llm_provider=llm_provider,
+            auto_confirm_events=should_auto_confirm_events,
         ).extract_chapter_candidates(chapter_id)
         session.commit()
         typer.echo(f"created {len(result.events)} event candidates and {len(result.state_changes)} state change candidates")

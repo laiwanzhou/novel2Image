@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     llm_json_mode: bool = True
     llm_max_tokens: int = 4096
     llm_timeout_seconds: float = 180.0
+    extraction_auto_confirm_events: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

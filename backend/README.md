@@ -61,6 +61,7 @@ NOVEL_VIS_LLM_MODEL=
 NOVEL_VIS_LLM_JSON_MODE=true
 NOVEL_VIS_LLM_MAX_TOKENS=4096
 NOVEL_VIS_LLM_TIMEOUT_SECONDS=180
+NOVEL_VIS_EXTRACTION_AUTO_CONFIRM_EVENTS=false
 ```
 
 Copy the root `.env.example` to `.env` for local overrides. Do not commit `.env`.
@@ -128,6 +129,9 @@ Run fake chapter extraction:
 ```
 
 With the default `NOVEL_VIS_LLM_PROVIDER=fake`, extraction returns deterministic empty candidate lists unless tests inject a fake response.
+By default, extracted `CharacterEvent` records and `CharacterStateChange` records are both saved as `candidate`.
+For long-form operator runs where events are treated as an audit log, use `--auto-confirm-events` or set `NOVEL_VIS_EXTRACTION_AUTO_CONFIRM_EVENTS=true`.
+This only auto-confirms `CharacterEvent`; `CharacterStateChange` remains `candidate`, and no `CharacterState` is synthesized automatically.
 
 To use an OpenAI-compatible FastGPT workflow instead:
 
@@ -204,7 +208,9 @@ Expected model output is strict JSON:
 
 Extraction remains review-first:
 
-- LLM output creates only candidate `CharacterEvent` and candidate `CharacterStateChange`.
+- LLM output creates candidate `CharacterEvent` and candidate `CharacterStateChange` by default.
+- If `NOVEL_VIS_EXTRACTION_AUTO_CONFIRM_EVENTS=true` or CLI `--auto-confirm-events` is used, only `CharacterEvent` is saved as `confirmed` with reviewer `auto-extraction`.
+- `CharacterStateChange` always remains `candidate` and requires review.
 - It does not create or confirm `CharacterState`.
 - It does not bypass manual review.
 - `character_id` must reference an existing confirmed character.

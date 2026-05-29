@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import json
 import uuid
 
@@ -53,11 +54,13 @@ class ExtractionService:
         chunk_repository: ChunkRepository,
         character_repository: CharacterRepository,
         llm_provider: LlmProvider,
+        auto_confirm_events: bool = False,
     ) -> None:
         self.state_repository = state_repository
         self.chunk_repository = chunk_repository
         self.character_repository = character_repository
         self.llm_provider = llm_provider
+        self.auto_confirm_events = auto_confirm_events
 
     def extract_chapter_candidates(self, chapter_id: uuid.UUID) -> ExtractionResult:
         chapter = self.chunk_repository.get_chapter(chapter_id)
@@ -140,6 +143,7 @@ class ExtractionService:
         with self.state_repository.session.begin_nested():
             events: list[CharacterEvent] = []
             for draft in event_drafts:
+                event_status = ReviewStatus.CONFIRMED.value if self.auto_confirm_events else ReviewStatus.CANDIDATE.value
                 event = CharacterEvent(
                     novel_id=chapter.novel_id,
                     character_id=draft.character_id,
@@ -152,7 +156,10 @@ class ExtractionService:
                     source_chunk_ids=draft.source_chunk_ids,
                     confidence=draft.confidence,
                     explanation=draft.explanation,
-                    status=ReviewStatus.CANDIDATE.value,
+                    status=event_status,
+                    reviewed_at=datetime.now(UTC) if self.auto_confirm_events else None,
+                    reviewed_by="auto-extraction" if self.auto_confirm_events else None,
+                    review_note="auto-confirmed after extraction validation" if self.auto_confirm_events else None,
                 )
                 events.append(self.state_repository.add_event(event))
 
