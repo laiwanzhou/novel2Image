@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import json
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -74,6 +75,11 @@ def test_full_auto_skips_existing_extraction_and_auto_confirms_states(pg_session
     assert [change.id for change in changes] == [existing_change.id, changes[1].id]
     assert all(change.status == ReviewStatus.CONFIRMED.value for change in changes)
     assert all(change.reviewed_by == "llm-reviewer" for change in changes)
+
+    first_block_summary = json.loads((tmp_path / "block-001-001" / "block_summary.json").read_text(encoding="utf-8"))
+    second_block_summary = json.loads((tmp_path / "block-002-002" / "block_summary.json").read_text(encoding="utf-8"))
+    assert first_block_summary["state_change_confirmed_count"] == 1
+    assert second_block_summary["state_change_confirmed_count"] == 1
 
     states = pg_session.scalars(select(CharacterState).order_by(CharacterState.chapter_start, CharacterState.created_at)).all()
     assert len(states) == 3

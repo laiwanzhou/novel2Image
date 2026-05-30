@@ -169,12 +169,12 @@ def run_full_auto_pipeline(
                 if not options.continue_on_error:
                     break
 
-        _fill_counts(session, options, block_summary)
+        _fill_counts(session, options, block_summary, range_start=block_start, range_end=block_end)
         block_report = _build_boundary_report(session, options, block_summary, block_start, block_end)
         _write_json(block_dir / "block_summary.json", block_summary)
         _write_json(block_dir / "block_boundary_report.json", block_report)
 
-    _fill_counts(session, options, summary)
+    _fill_counts(session, options, summary, range_start=options.chapter_start, range_end=options.chapter_end)
     _fill_final_observations(session, options, summary)
     _write_json(log_dir / "full_auto_summary.json", summary)
     _write_markdown_report(log_dir / "full_auto_report.md", summary)
@@ -472,17 +472,24 @@ def _count_synthesis(summary: dict[str, Any], block_summary: dict[str, Any], pay
             target["auto_confirmed_state_count"] += 1
 
 
-def _fill_counts(session: Session, options: FullAutoPipelineOptions, summary: dict[str, Any]) -> None:
+def _fill_counts(
+    session: Session,
+    options: FullAutoPipelineOptions,
+    summary: dict[str, Any],
+    *,
+    range_start: int,
+    range_end: int,
+) -> None:
     state_repository = StateRepository(session)
     events = [
         event
         for event in state_repository.list_events(novel_id=options.novel_id)
-        if options.chapter_start <= event.chapter_index <= options.chapter_end
+        if range_start <= event.chapter_index <= range_end
     ]
     changes = [
         change
         for change in state_repository.list_state_changes(novel_id=options.novel_id)
-        if options.chapter_start <= change.chapter_index <= options.chapter_end
+        if range_start <= change.chapter_index <= range_end
     ]
     summary["state_change_confirmed_count"] = sum(
         1 for change in changes if change.status == ReviewStatus.CONFIRMED.value
