@@ -291,15 +291,45 @@ def _synthesize_chapter_states(
         status=ReviewStatus.CONFIRMED.value,
     )
     results: list[dict[str, Any]] = []
+    synthesized_keys: set[tuple[uuid.UUID, int]] = set()
     for state_change in confirmed_changes:
         existing = session.scalar(select(CharacterState).where(CharacterState.state_change_id == state_change.id).limit(1))
         if existing is not None:
+            synthesized_keys.add((state_change.character_id, state_change.chapter_index))
             results.append(
                 {
                     "state_change_id": str(state_change.id),
                     "state_id": str(existing.id),
                     "created": False,
                     "confirmed": existing.status == ReviewStatus.CONFIRMED.value,
+                    "skipped_same_chapter": False,
+                    "error": None,
+                }
+            )
+            continue
+        same_chapter_state = session.scalar(
+            select(CharacterState)
+            .where(
+                CharacterState.novel_id == state_change.novel_id,
+                CharacterState.character_id == state_change.character_id,
+                CharacterState.chapter_start == state_change.chapter_index,
+                CharacterState.state_change_id.is_not(None),
+            )
+            .order_by(CharacterState.created_at)
+            .limit(1)
+        )
+        key = (state_change.character_id, state_change.chapter_index)
+        if same_chapter_state is not None or key in synthesized_keys:
+            results.append(
+                {
+                    "state_change_id": str(state_change.id),
+                    "state_id": str(same_chapter_state.id) if same_chapter_state is not None else None,
+                    "created": False,
+                    "confirmed": same_chapter_state.status == ReviewStatus.CONFIRMED.value
+                    if same_chapter_state is not None
+                    else False,
+                    "seeded_state_id": None,
+                    "skipped_same_chapter": True,
                     "error": None,
                 }
             )
@@ -329,9 +359,11 @@ def _synthesize_chapter_states(
                     "created": True,
                     "confirmed": confirmed,
                     "seeded_state_id": str(seeded_state.id) if seeded_state is not None else None,
+                    "skipped_same_chapter": False,
                     "error": None,
                 }
             )
+            synthesized_keys.add(key)
         except Exception as exc:
             results.append(
                 {
@@ -340,6 +372,7 @@ def _synthesize_chapter_states(
                     "created": False,
                     "confirmed": False,
                     "seeded_state_id": None,
+                    "skipped_same_chapter": False,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
@@ -457,6 +490,7 @@ def _empty_summary(options: FullAutoPipelineOptions, *, total_chapters: int) -> 
         "needs_human_count": 0,
         "low_confidence_remaining_count": 0,
         "synthesized_state_count": 0,
+        "synthesis_skipped_same_chapter_count": 0,
         "auto_confirmed_state_count": 0,
         "seeded_state_count": 0,
         "per_character_state_count": {},
@@ -491,6 +525,7 @@ def _empty_block_summary(block_start: int, block_end: int) -> dict[str, Any]:
         "needs_human_count": 0,
         "low_confidence_remaining_count": 0,
         "synthesized_state_count": 0,
+        "synthesis_skipped_same_chapter_count": 0,
         "auto_confirmed_state_count": 0,
         "seeded_state_count": 0,
         "synthesis_failure_count": 0,
@@ -544,6 +579,8 @@ def _count_synthesis(summary: dict[str, Any], block_summary: dict[str, Any], pay
             target["synthesis_failure_count"] += 1
         if payload["created"]:
             target["synthesized_state_count"] += 1
+        if payload.get("skipped_same_chapter"):
+            target["synthesis_skipped_same_chapter_count"] += 1
         if payload["confirmed"]:
             target["auto_confirmed_state_count"] += 1
         if payload.get("seeded_state_id"):

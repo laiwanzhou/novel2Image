@@ -605,6 +605,141 @@ def test_extraction_rejects_invalid_changed_field_name(pg_session: Session) -> N
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
+def test_extraction_normalizes_visual_keywords_string_changed_field(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing gains a new look.",
+                    "event_type": "appearance",
+                    "is_long_term_change": True,
+                    "affected_fields": ["visual_keywords"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter gives durable visual evidence.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "visual_keywords",
+                            "before": "旧袍、木剑",
+                            "after": "红眼, 黑甲、长剑；红眼\n披风",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        },
+                        {
+                            "field": "appearance",
+                            "after": "红眼, 黑甲、长剑",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        },
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Visual keywords are durable.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    fields = result.state_changes[0].changed_fields
+    assert fields[0]["before"] == ["旧袍", "木剑"]
+    assert fields[0]["after"] == ["红眼", "黑甲", "长剑", "披风"]
+    assert fields[1]["after"] == "红眼, 黑甲、长剑"
+
+
+def test_extraction_keeps_visual_keywords_list_and_rejects_invalid_type(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    valid_provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing gains a new look.",
+                    "event_type": "appearance",
+                    "is_long_term_change": True,
+                    "affected_fields": ["visual_keywords"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter gives durable visual evidence.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "visual_keywords",
+                            "after": ["红眼", "黑甲"],
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Visual keywords are durable.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=valid_provider,
+    )
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+    assert result.state_changes[0].changed_fields[0]["after"] == ["红眼", "黑甲"]
+
+    invalid_provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing gains a new look again.",
+                    "event_type": "appearance",
+                    "is_long_term_change": True,
+                    "affected_fields": ["visual_keywords"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter gives durable visual evidence.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "visual_keywords",
+                            "after": {"bad": "shape"},
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Visual keywords are durable.",
+                }
+            ],
+        }
+    )
+    invalid_service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=invalid_provider,
+    )
+
+    with pytest.raises(ValueError, match="visual_keywords"):
+        invalid_service.extract_chapter_candidates(fixture.chapter.id)
+
+
 def test_extraction_rejects_state_change_without_event_index(pg_session: Session) -> None:
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
     provider = FakeLlmProvider(

@@ -17,7 +17,7 @@ from app.services.llm_diagnostics import (
     RawLlmResponseDiagnosticsWriter,
     safe_write_raw_llm_failure,
 )
-from app.services.state_service import STATE_FIELDS
+from app.services.state_service import STATE_FIELDS, normalize_visual_keywords
 
 
 ALLOWED_EVENT_TYPES = tuple(event_type.value for event_type in EventType)
@@ -278,6 +278,10 @@ class ExtractionService:
                 raise ValueError("Each changed field requires field and after")
             if change["field"] not in STATE_FIELDS:
                 raise ValueError(f"Invalid changed field from LLM: {change['field']}")
+            if change["field"] == "visual_keywords":
+                change["after"] = normalize_visual_keywords(change.get("after")) or []
+                if "before" in change:
+                    change["before"] = normalize_visual_keywords(change.get("before")) or []
             change["source_chunk_ids"] = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
         return changed_fields
 

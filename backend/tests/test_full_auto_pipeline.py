@@ -196,6 +196,55 @@ def test_full_auto_does_not_synthesize_same_state_change_twice(pg_session: Sessi
     assert pg_session.scalar(select(func.count()).select_from(CharacterState).where(CharacterState.state_change_id == change.id)) == 1
 
 
+def test_full_auto_skips_second_confirmed_state_change_for_same_character_chapter(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_full_auto_fixture(pg_session)
+    event = _add_confirmed_event(pg_session, fixture, 1)
+    first_change = _add_confirmed_change(pg_session, fixture, 1, event)
+    second_change = _add_confirmed_change(pg_session, fixture, 1, event)
+    second_change.changed_fields = [
+        {
+            "field": "motivation",
+            "before": "survive",
+            "after": "protect allies",
+            "source_chunk_ids": [str(fixture.chunks[1].id)],
+        }
+    ]
+    pg_session.commit()
+    provider = SequencedLlmProvider(extraction_responses=[], review_responses=[])
+
+    result = run_full_auto_pipeline(
+        pg_session,
+        FullAutoPipelineOptions(
+            novel_id=fixture.novel.id,
+            chapter_start=1,
+            chapter_end=1,
+            block_size=20,
+            auto_confirm_events=True,
+            auto_review_state_changes=True,
+            auto_apply_reviewer_decisions=True,
+            auto_synthesize_states=True,
+            auto_confirm_synthesized_states=True,
+            continue_on_error=True,
+            log_dir=tmp_path,
+        ),
+        extraction_provider=provider,
+        review_provider=provider,
+    )
+
+    assert result["synthesis_failure_count"] == 0
+    assert result["synthesized_state_count"] == 1
+    assert result["synthesis_skipped_same_chapter_count"] == 1
+    states = pg_session.scalars(
+        select(CharacterState).where(CharacterState.state_change_id.in_([first_change.id, second_change.id]))
+    ).all()
+    assert len(states) == 1
+    chapter_log = (tmp_path / "chapter-0001.jsonl").read_text(encoding="utf-8")
+    assert "skipped_same_chapter" in chapter_log
+
+
 def test_full_auto_synthesis_failure_does_not_rollback_confirmed_state_change(pg_session: Session, tmp_path) -> None:
     fixture = _create_full_auto_fixture(pg_session)
     existing_initial = pg_session.scalar(

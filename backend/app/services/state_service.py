@@ -18,6 +18,34 @@ STATE_FIELDS = {
 }
 
 
+def normalize_visual_keywords(value):
+    if value is None:
+        return None
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return _dedupe_keywords(value)
+    if isinstance(value, str):
+        parts = [part.strip() for part in re_split_visual_keywords(value)]
+        return _dedupe_keywords([part for part in parts if part])
+    raise ValueError("visual_keywords change must be a list of strings or a string")
+
+
+def re_split_visual_keywords(value: str) -> list[str]:
+    import re
+
+    return re.split(r"[，,、;；\n\r]+", value)
+
+
+def _dedupe_keywords(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        stripped = value.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            deduped.append(stripped)
+    return deduped
+
+
 class StateService:
     def __init__(self, repository: StateRepository) -> None:
         self.repository = repository
@@ -79,8 +107,8 @@ class StateService:
         )
         for change in state_change.changed_fields:
             field = change["field"]
-            self._validate_change_after(field, change.get("after"))
-            setattr(values, field, change.get("after"))
+            after = self._validate_change_after(field, change.get("after"))
+            setattr(values, field, after)
 
         state = CharacterState(
             novel_id=state_change.novel_id,
@@ -179,15 +207,14 @@ class StateService:
         self.repository.session.flush()
         return state_change
 
-    def _validate_change_after(self, field: str, after) -> None:
+    def _validate_change_after(self, field: str, after):
         if field not in STATE_FIELDS:
             raise ValueError(f"Unsupported CharacterState field change: {field}")
         if field == "visual_keywords":
-            if not isinstance(after, list) or not all(isinstance(item, str) for item in after):
-                raise ValueError("visual_keywords change must be a list of strings")
-            return
+            return normalize_visual_keywords(after) or []
         if after is not None and not isinstance(after, str):
             raise ValueError(f"{field} change must be a string or null")
+        return after
 
     def _mark_reviewed(self, target, status: str, reviewer: str, note: str | None) -> None:
         if target.status != ReviewStatus.CANDIDATE.value:

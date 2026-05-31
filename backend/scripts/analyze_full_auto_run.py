@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 from typing import Any
+import uuid
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
@@ -91,6 +92,56 @@ def classify_synthesis_failure(message: str) -> str:
     return "unknown"
 
 
+def load_raw_llm_diagnostics(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    diagnostics: dict[str, list[dict[str, Any]]] = {}
+    for raw_dir in _raw_diagnostics_dirs(run_dir):
+        if not raw_dir.exists():
+            continue
+        for path in sorted(raw_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            chapter_index = payload.get("chapter_index")
+            failure_type = payload.get("failure_type")
+            if chapter_index is None or not failure_type:
+                continue
+            entry = {
+                **payload,
+                "raw_diagnostics_file": str(path),
+                "raw_response_available": bool(payload.get("raw_response")),
+                "raw_parsed_response_available": bool(
+                    payload.get("raw_parsed_response")
+                    or payload.get("parsed_response")
+                    or payload.get("returned_source_chunk_ids")
+                    or payload.get("returned_character_ids")
+                ),
+            }
+            diagnostics.setdefault(_diagnostic_key(chapter_index, failure_type), []).append(entry)
+    return diagnostics
+
+
+def _raw_diagnostics_dirs(run_dir: Path) -> list[Path]:
+    return [
+        run_dir / "diagnostics" / "raw-llm-responses",
+        run_dir.parent / "diagnostics" / "raw-llm-responses",
+    ]
+
+
+def _diagnostic_key(chapter_index, failure_type: str) -> str:
+    return f"{chapter_index}:{failure_type}"
+
+
+def _diagnostic_for_failure(failure: dict[str, Any], diagnostics: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    category = classify_extraction_failure(failure.get("error", ""))
+    matches = diagnostics.get(_diagnostic_key(failure.get("chapter_index"), category), [])
+    chapter_id = failure.get("chapter_id")
+    for match in matches:
+        if not chapter_id or match.get("chapter_id") == chapter_id:
+            return match
+    return matches[0] if matches else None
+
+
 def analyze_run(run_dir: Path, *, database_url: str | None = None) -> dict[str, Any]:
     summary_path = run_dir / "full_auto_summary.json"
     report_path = run_dir / "full_auto_report.md"
@@ -100,12 +151,13 @@ def analyze_run(run_dir: Path, *, database_url: str | None = None) -> dict[str, 
     db = DatabaseInspector(database_url) if database_url else NullDatabaseInspector()
     diagnostics_dir = run_dir / "diagnostics"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    raw_diagnostics = load_raw_llm_diagnostics(run_dir)
 
     mojibake = analyze_mojibake(summary, report_path, chapter_logs, db)
     synthesis = analyze_synthesis_failures(chapter_logs, db)
-    extraction = analyze_extraction_failures(summary, chapter_logs, db)
-    source_chunks = analyze_source_chunk_failures(summary, db)
-    characters = analyze_character_reference_failures(summary, db)
+    extraction = analyze_extraction_failures(summary, chapter_logs, db, raw_diagnostics)
+    source_chunks = analyze_source_chunk_failures(summary, db, raw_diagnostics)
+    characters = analyze_character_reference_failures(summary, db, raw_diagnostics)
     quality = analyze_quality(summary, mojibake, synthesis, extraction, source_chunks, characters)
 
     _write_report_pair(
@@ -251,13 +303,20 @@ def analyze_synthesis_failures(chapter_logs: dict[int, Path], db) -> dict[str, A
     }
 
 
-def analyze_extraction_failures(summary: dict[str, Any], chapter_logs: dict[int, Path], db) -> dict[str, Any]:
+def analyze_extraction_failures(
+    summary: dict[str, Any],
+    chapter_logs: dict[int, Path],
+    db,
+    raw_diagnostics: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     failures = []
+    raw_diagnostics = raw_diagnostics or {}
     for failure in summary.get("failed_chapters", []):
         message = failure.get("error", "")
         chapter_index = failure.get("chapter_index")
         category = classify_extraction_failure(message)
         partial = db.chapter_has_events_or_changes(failure.get("chapter_id"))
+        diagnostic = _diagnostic_for_failure(failure, raw_diagnostics)
         failures.append(
             {
                 "chapter_index": chapter_index,
@@ -272,6 +331,13 @@ def analyze_extraction_failures(summary: dict[str, Any], chapter_logs: dict[int,
                 "possibly_source_chunk_prompt_constraint": category == "source_chunk_not_current_chapter",
                 "possibly_character_alias_or_confirmation_gap": category == "invalid_character_reference",
                 "chapter_log_exists": chapter_index in chapter_logs,
+                "raw_diagnostics_file": diagnostic.get("raw_diagnostics_file") if diagnostic else None,
+                "raw_response_available": bool(diagnostic.get("raw_response_available")) if diagnostic else False,
+                "raw_parsed_response_available": bool(diagnostic.get("raw_parsed_response_available"))
+                if diagnostic
+                else False,
+                "returned_source_chunk_ids": diagnostic.get("returned_source_chunk_ids") if diagnostic else None,
+                "returned_character_ids": diagnostic.get("returned_character_ids") if diagnostic else None,
             }
         )
     distribution = Counter(failure["failure_category"] for failure in failures)
@@ -282,7 +348,12 @@ def analyze_extraction_failures(summary: dict[str, Any], chapter_logs: dict[int,
     }
 
 
-def analyze_source_chunk_failures(summary: dict[str, Any], db) -> dict[str, Any]:
+def analyze_source_chunk_failures(
+    summary: dict[str, Any],
+    db,
+    raw_diagnostics: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    raw_diagnostics = raw_diagnostics or {}
     failures = [
         failure
         for failure in summary.get("failed_chapters", [])
@@ -291,14 +362,25 @@ def analyze_source_chunk_failures(summary: dict[str, Any], db) -> dict[str, Any]
     details = []
     for failure in failures:
         chapter_id = failure.get("chapter_id")
+        diagnostic = _diagnostic_for_failure(failure, raw_diagnostics)
+        returned_ids = diagnostic.get("returned_source_chunk_ids") if diagnostic else None
+        returned_analysis = (
+            [db.chunk_id_info(chunk_id, current_chapter_id=chapter_id) for chunk_id in returned_ids]
+            if returned_ids
+            else None
+        )
         details.append(
             {
                 "chapter_index": failure.get("chapter_index"),
                 "chapter_id": chapter_id,
                 "failure_message": failure.get("error"),
                 "current_chapter_chunk_ids": db.chunk_ids_for_chapter(chapter_id),
-                "llm_returned_source_chunk_ids": None,
-                "wrong_chunk_id_lookup": "unavailable: raw invalid LLM response is not logged by current pipeline",
+                "llm_returned_source_chunk_ids": returned_ids,
+                "returned_source_chunk_id_analysis": returned_analysis,
+                "raw_diagnostics_file": diagnostic.get("raw_diagnostics_file") if diagnostic else None,
+                "wrong_chunk_id_lookup": None
+                if diagnostic
+                else "unavailable: raw invalid LLM response is not logged by current pipeline",
                 "likely_reason": "model returned chunk ids outside current chapter or malformed ids; guard rejected entire chapter before partial DB write",
                 "recommended_policy": "keep failing whole chapter until response repair/instrumentation is designed; do not silently map or drop evidence ids without review",
             }
@@ -306,11 +388,18 @@ def analyze_source_chunk_failures(summary: dict[str, Any], db) -> dict[str, Any]
     return {
         "failure_count": len(details),
         "details": details,
-        "limitation": "The current logs only contain validation error text, not the raw invalid LLM response, so exact wrong source_chunk_ids cannot be recovered from this run.",
+        "limitation": None
+        if any(detail.get("raw_diagnostics_file") for detail in details)
+        else "The current logs only contain validation error text, not the raw invalid LLM response, so exact wrong source_chunk_ids cannot be recovered from this run.",
     }
 
 
-def analyze_character_reference_failures(summary: dict[str, Any], db) -> dict[str, Any]:
+def analyze_character_reference_failures(
+    summary: dict[str, Any],
+    db,
+    raw_diagnostics: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    raw_diagnostics = raw_diagnostics or {}
     failures = [
         failure
         for failure in summary.get("failed_chapters", [])
@@ -318,14 +407,20 @@ def analyze_character_reference_failures(summary: dict[str, Any], db) -> dict[st
     ]
     details = []
     for failure in failures:
+        diagnostic = _diagnostic_for_failure(failure, raw_diagnostics)
+        returned_ids = diagnostic.get("returned_character_ids") if diagnostic else None
+        returned_analysis = [db.character_id_info(character_id) for character_id in returned_ids] if returned_ids else None
         details.append(
             {
                 "chapter_index": failure.get("chapter_index"),
                 "chapter_id": failure.get("chapter_id"),
                 "failure_message": failure.get("error"),
-                "llm_returned_character_id": None,
-                "character_exists": None,
-                "character_confirmed": None,
+                "llm_returned_character_id": returned_ids[0] if returned_ids else None,
+                "returned_character_ids": returned_ids,
+                "returned_character_id_analysis": returned_analysis,
+                "character_exists": returned_analysis[0].get("exists") if returned_analysis else None,
+                "character_confirmed": returned_analysis[0].get("confirmed") if returned_analysis else None,
+                "raw_diagnostics_file": diagnostic.get("raw_diagnostics_file") if diagnostic else None,
                 "likely_new_character_or_alias_gap": True,
                 "should_enter_character_discovery": True,
                 "should_allow_new_character_candidates": "consider later; current schema/prompt intentionally requires confirmed characters for state/event extraction",
@@ -335,7 +430,9 @@ def analyze_character_reference_failures(summary: dict[str, Any], db) -> dict[st
     return {
         "failure_count": len(details),
         "details": details,
-        "limitation": "The current logs only contain validation error text, not the raw invalid LLM response, so exact character_id/name cannot be recovered from this run.",
+        "limitation": None
+        if any(detail.get("raw_diagnostics_file") for detail in details)
+        else "The current logs only contain validation error text, not the raw invalid LLM response, so exact character_id/name cannot be recovered from this run.",
     }
 
 
@@ -397,6 +494,12 @@ class NullDatabaseInspector:
 
     def chunk_ids_for_chapter(self, chapter_id: str) -> list[str]:
         return []
+
+    def chunk_id_info(self, chunk_id: str, current_chapter_id: str | None = None) -> dict[str, Any]:
+        return {"id": chunk_id, "status": "unknown_without_database"}
+
+    def character_id_info(self, character_id: str) -> dict[str, Any]:
+        return {"id": character_id, "exists": None, "status": None, "confirmed": None}
 
 
 class DatabaseInspector:
@@ -533,6 +636,62 @@ class DatabaseInspector:
             ).scalars()
             return list(rows)
 
+    def chunk_id_info(self, chunk_id: str, current_chapter_id: str | None = None) -> dict[str, Any]:
+        try:
+            uuid_value = str(uuid.UUID(str(chunk_id)))
+        except (TypeError, ValueError):
+            return {"id": str(chunk_id), "status": "malformed_uuid"}
+        with Session(self.engine) as session:
+            row = session.execute(
+                text(
+                    """
+                    select cc.id::text, cc.chapter_id::text, cc.chunk_index,
+                           ch.chapter_index, ch.novel_id::text
+                    from chapter_chunks cc
+                    join chapters ch on ch.id = cc.chapter_id
+                    where cc.id = cast(:id as uuid)
+                    """
+                ),
+                {"id": uuid_value},
+            ).mappings().first()
+        if not row:
+            return {"id": uuid_value, "status": "missing"}
+        status = "current_chapter" if current_chapter_id and str(row["chapter_id"]) == str(current_chapter_id) else "other_chapter"
+        return {
+            "id": row["id"],
+            "status": status,
+            "chapter_id": row["chapter_id"],
+            "chapter_index": row["chapter_index"],
+            "chunk_index": row["chunk_index"],
+            "novel_id": row["novel_id"],
+        }
+
+    def character_id_info(self, character_id: str) -> dict[str, Any]:
+        try:
+            uuid_value = str(uuid.UUID(str(character_id)))
+        except (TypeError, ValueError):
+            return {"id": str(character_id), "exists": False, "status": "malformed_uuid", "confirmed": False}
+        with Session(self.engine) as session:
+            row = session.execute(
+                text(
+                    """
+                    select id::text, canonical_name, status
+                    from characters
+                    where id = cast(:id as uuid)
+                    """
+                ),
+                {"id": uuid_value},
+            ).mappings().first()
+        if not row:
+            return {"id": uuid_value, "exists": False, "status": None, "confirmed": False}
+        return {
+            "id": row["id"],
+            "exists": True,
+            "canonical_name": row["canonical_name"],
+            "status": row["status"],
+            "confirmed": row["status"] == "confirmed",
+        }
+
 
 def _write_report_pair(base_path: Path, payload: dict[str, Any], markdown: str) -> None:
     base_path.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -591,9 +750,11 @@ def render_source_chunk_markdown(data: dict[str, Any]) -> str:
         "## Details",
     ]
     for detail in data["details"]:
+        returned = detail.get("llm_returned_source_chunk_ids")
+        returned_text = returned if returned is not None else "unavailable"
         lines.append(
             f"- chapter {detail['chapter_index']}: current chunks={detail['current_chapter_chunk_ids']}; "
-            f"returned ids unavailable"
+            f"returned ids={returned_text}"
         )
     return "\n".join(lines) + "\n"
 
@@ -608,9 +769,11 @@ def render_character_reference_markdown(data: dict[str, Any]) -> str:
         "## Details",
     ]
     for detail in data["details"]:
+        returned = detail.get("returned_character_ids")
+        returned_text = returned if returned is not None else "unavailable"
         lines.append(
             f"- chapter {detail['chapter_index']}: {detail['failure_message']}; "
-            "raw returned character id unavailable"
+            f"returned character ids={returned_text}"
         )
     return "\n".join(lines) + "\n"
 
