@@ -1,16 +1,22 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 import uuid
 
 from app.core.enums import EventType, ReviewStatus
 from app.models.character import Character
 from app.models.novel import Chapter, ChapterChunk
 from app.models.state import CharacterEvent, CharacterStateChange
-from app.providers.llm import LlmProvider
+from app.providers.llm import LlmProvider, LlmProviderResponseError
 from app.repositories.characters import CharacterRepository
 from app.repositories.chunks import ChunkRepository
 from app.repositories.states import StateRepository
+from app.services.llm_diagnostics import (
+    RawLlmDiagnosticsContext,
+    RawLlmResponseDiagnosticsWriter,
+    safe_write_raw_llm_failure,
+)
 from app.services.state_service import STATE_FIELDS
 
 
@@ -55,12 +61,14 @@ class ExtractionService:
         character_repository: CharacterRepository,
         llm_provider: LlmProvider,
         auto_confirm_events: bool = False,
+        diagnostics_dir: Path | None = None,
     ) -> None:
         self.state_repository = state_repository
         self.chunk_repository = chunk_repository
         self.character_repository = character_repository
         self.llm_provider = llm_provider
         self.auto_confirm_events = auto_confirm_events
+        self.diagnostics_writer = RawLlmResponseDiagnosticsWriter(diagnostics_dir)
 
     def extract_chapter_candidates(self, chapter_id: uuid.UUID) -> ExtractionResult:
         chapter = self.chunk_repository.get_chapter(chapter_id)
@@ -68,14 +76,46 @@ class ExtractionService:
             raise ValueError(f"Chapter not found: {chapter_id}")
         chunks = self.chunk_repository.list_chunks_for_chapter(chapter_id)
         allowed_chunk_ids = {str(chunk.id) for chunk in chunks}
-        response = self.llm_provider.generate_json(
-            self._system_prompt(),
-            self._user_prompt(chapter=chapter, chunks=chunks),
+        confirmed_characters = self.character_repository.list_characters(
+            chapter.novel_id,
+            ReviewStatus.CONFIRMED.value,
         )
-        event_drafts, state_change_drafts = self._validate_response(
-            response=response,
-            allowed_chunk_ids=allowed_chunk_ids,
+        system_prompt = self._system_prompt()
+        user_prompt = self._user_prompt(chapter=chapter, chunks=chunks, confirmed_characters=confirmed_characters)
+        diagnostics_context = RawLlmDiagnosticsContext(
+            chapter_id=chapter.id,
+            chapter_index=chapter.chapter_index,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            allowed_current_chapter_chunk_ids=sorted(allowed_chunk_ids),
+            confirmed_character_ids=sorted(str(character.id) for character in confirmed_characters),
+            provider=getattr(self.llm_provider, "provider_name", None),
+            model=getattr(self.llm_provider, "model", None),
         )
+        try:
+            response = self.llm_provider.generate_json(system_prompt, user_prompt)
+            event_drafts, state_change_drafts = self._validate_response(
+                response=response,
+                allowed_chunk_ids=allowed_chunk_ids,
+            )
+        except LlmProviderResponseError as exc:
+            safe_write_raw_llm_failure(
+                self.diagnostics_writer,
+                context=diagnostics_context,
+                error=exc,
+                raw_response_text=exc.raw_response,
+                raw_parsed_response=exc.parsed_response,
+            )
+            raise
+        except ValueError as exc:
+            raw_parsed_response = locals().get("response")
+            safe_write_raw_llm_failure(
+                self.diagnostics_writer,
+                context=diagnostics_context,
+                error=exc,
+                raw_parsed_response=raw_parsed_response if isinstance(raw_parsed_response, dict) else None,
+            )
+            raise
         return self._persist_validated_response(
             chapter=chapter,
             event_drafts=event_drafts,
@@ -303,11 +343,13 @@ Rules:
 - Do not invent facts that are not supported by source chunks.
 """.strip()
 
-    def _user_prompt(self, *, chapter: Chapter, chunks: list[ChapterChunk]) -> str:
-        confirmed_characters = self.character_repository.list_characters(
-            chapter.novel_id,
-            ReviewStatus.CONFIRMED.value,
-        )
+    def _user_prompt(
+        self,
+        *,
+        chapter: Chapter,
+        chunks: list[ChapterChunk],
+        confirmed_characters: list[Character],
+    ) -> str:
         payload = {
             "chapter": {
                 "id": str(chapter.id),

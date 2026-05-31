@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -8,7 +9,7 @@ from app.core.enums import ReviewStatus
 from app.models.character import Character
 from app.models.novel import Chapter, ChapterChunk, Novel
 from app.models.state import CharacterEvent, CharacterState, CharacterStateChange
-from app.providers.llm import FakeLlmProvider
+from app.providers.llm import FakeLlmProvider, LlmProviderResponseError
 from app.repositories.chunks import ChunkRepository
 from app.repositories.characters import CharacterRepository
 from app.repositories.states import StateRepository
@@ -183,6 +184,148 @@ def test_extraction_rejects_event_with_chunk_outside_current_chapter(pg_session:
         chunk_repository=ChunkRepository(pg_session),
         character_repository=CharacterRepository(pg_session),
         llm_provider=provider,
+    )
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_diagnostics_write_raw_provider_response_for_invalid_json(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    raw_response = '{"events": ['
+    provider = RaisingLlmProvider(
+        LlmProviderResponseError(
+            "FastGPT LLM response must be valid JSON",
+            raw_response=raw_response,
+            provider_name="fastgpt",
+            model="deepseek-v4-pro",
+        )
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        diagnostics_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "invalid_json"
+    assert payload["raw_response_text"] == raw_response
+    assert payload["provider"] == "fastgpt"
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["chapter_id"] == str(fixture.chapter.id)
+    assert payload["chapter_index"] == fixture.chapter.chapter_index
+    assert payload["allowed_current_chapter_chunk_ids"] == [str(fixture.chunk.id)]
+    assert payload["confirmed_character_ids"] == [str(fixture.character.id)]
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "sk-" not in serialized
+    assert fixture.chunk.text not in serialized
+
+
+def test_extraction_diagnostics_write_parsed_response_for_invalid_source_chunk(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk = _create_outside_chapter_chunk(pg_session, fixture.novel.id)
+    response = {
+        "events": [
+            {
+                "character_id": str(fixture.character.id),
+                "event_summary": "Lin Qing joins the inner sect.",
+                "event_type": "identity",
+                "is_long_term_change": True,
+                "affected_fields": ["identity"],
+                "source_chunk_ids": [str(outside_chunk.id)],
+            }
+        ],
+        "state_changes": [],
+    }
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=FakeLlmProvider(response=response),
+        diagnostics_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "source_chunk_not_current_chapter"
+    assert payload["raw_parsed_response"] == response
+    assert payload["returned_source_chunk_ids"] == [str(outside_chunk.id)]
+
+
+def test_extraction_diagnostics_write_parsed_response_for_invalid_character(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    unknown_character_id = "00000000-0000-0000-0000-000000000999"
+    response = {
+        "events": [
+            {
+                "character_id": unknown_character_id,
+                "event_summary": "Unknown character event.",
+                "event_type": "identity",
+                "is_long_term_change": True,
+                "affected_fields": ["identity"],
+                "source_chunk_ids": [str(fixture.chunk.id)],
+            }
+        ],
+        "state_changes": [],
+    }
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=FakeLlmProvider(response=response),
+        diagnostics_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="confirmed character"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "invalid_character_reference"
+    assert payload["raw_parsed_response"] == response
+    assert payload["returned_character_ids"] == [unknown_character_id]
+
+
+def test_extraction_diagnostics_write_failure_does_not_mask_original_error(pg_session: Session, tmp_path) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk = _create_outside_chapter_chunk(pg_session, fixture.novel.id)
+    blocked_diagnostics_path = tmp_path / "not-a-directory"
+    blocked_diagnostics_path.write_text("file blocks mkdir", encoding="utf-8")
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=FakeLlmProvider(
+            response={
+                "events": [
+                    {
+                        "character_id": str(fixture.character.id),
+                        "event_summary": "Lin Qing joins the inner sect.",
+                        "event_type": "identity",
+                        "is_long_term_change": True,
+                        "affected_fields": ["identity"],
+                        "source_chunk_ids": [str(outside_chunk.id)],
+                    }
+                ],
+                "state_changes": [],
+            }
+        ),
+        diagnostics_dir=blocked_diagnostics_path,
     )
 
     with pytest.raises(ValueError, match="current chapter"):
@@ -641,6 +784,17 @@ class ExtractionFixture:
         self.character = character
 
 
+class RaisingLlmProvider:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
+        raise self.error
+
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict:
+        raise AssertionError("review is not used")
+
+
 def _service_for_event_type(pg_session: Session, fixture: ExtractionFixture, event_type: str) -> ExtractionService:
     provider = FakeLlmProvider(
         response={
@@ -796,3 +950,9 @@ def _create_other_novel_chunk(pg_session: Session) -> ChapterChunk:
 
 def _count_rows(pg_session: Session, model: type) -> int:
     return pg_session.scalar(select(func.count()).select_from(model)) or 0
+
+
+def _single_diagnostic_payload(path) -> dict:
+    files = list(path.glob("*.json"))
+    assert len(files) == 1
+    return json.loads(files[0].read_text(encoding="utf-8"))

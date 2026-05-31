@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from app.core.config import get_settings  # noqa: E402
 from app.core.db import SessionLocal  # noqa: E402
 from app.core.enums import ReviewStatus  # noqa: E402
+from app.models.character import Character  # noqa: E402
 from app.models.novel import Chapter  # noqa: E402
 from app.models.state import CharacterEvent, CharacterState, CharacterStateChange  # noqa: E402
 from app.providers.llm import LlmProvider, get_llm_provider  # noqa: E402
@@ -50,6 +51,7 @@ class FullAutoPipelineOptions:
     auto_apply_reviewer_decisions: bool = False
     auto_synthesize_states: bool = False
     auto_confirm_synthesized_states: bool = False
+    auto_seed_missing_character_states: bool = False
     confirm_threshold: float = 0.85
     reject_threshold: float = 0.9
     continue_on_error: bool = True
@@ -304,6 +306,13 @@ def _synthesize_chapter_states(
             continue
         try:
             with session.begin_nested():
+                seeded_state = None
+                if options.auto_seed_missing_character_states:
+                    seeded_state = _seed_missing_character_state_if_needed(
+                        session=session,
+                        state_repository=state_repository,
+                        state_change=state_change,
+                    )
                 state = state_service.synthesize_candidate_from_change(state_change.id)
                 confirmed = False
                 if options.auto_confirm_synthesized_states:
@@ -319,6 +328,7 @@ def _synthesize_chapter_states(
                     "state_id": str(state.id),
                     "created": True,
                     "confirmed": confirmed,
+                    "seeded_state_id": str(seeded_state.id) if seeded_state is not None else None,
                     "error": None,
                 }
             )
@@ -329,10 +339,74 @@ def _synthesize_chapter_states(
                     "state_id": None,
                     "created": False,
                     "confirmed": False,
+                    "seeded_state_id": None,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
     return results
+
+
+def _seed_missing_character_state_if_needed(
+    *,
+    session: Session,
+    state_repository: StateRepository,
+    state_change: CharacterStateChange,
+) -> CharacterState | None:
+    if state_change.character_id is None:
+        return None
+    previous = state_repository.latest_confirmed_state_before_or_at(
+        state_change.character_id,
+        state_change.chapter_index,
+    )
+    if previous is not None:
+        return None
+    character = session.get(Character, state_change.character_id)
+    values = _seed_values(character, state_change)
+    seed = CharacterState(
+        novel_id=state_change.novel_id,
+        character_id=state_change.character_id,
+        chapter_start=max(0, state_change.chapter_index - 1),
+        chapter_end=None,
+        appearance=values["appearance"],
+        personality=values["personality"],
+        identity=values["identity"],
+        motivation=values["motivation"],
+        relationship_summary=values["relationship_summary"],
+        visual_keywords=values["visual_keywords"],
+        negative_prompt=values["negative_prompt"],
+        source_chapters=[state_change.chapter_index],
+        source_chunk_ids=state_change.source_chunk_ids,
+        event_id=None,
+        state_change_id=None,
+        confidence=state_change.confidence,
+        status=ReviewStatus.CONFIRMED.value,
+        reviewed_at=datetime.now(UTC),
+        reviewed_by="full-auto-pipeline",
+        review_note="auto-seeded missing initial CharacterState before synthesis",
+    )
+    return state_repository.add_state(seed)
+
+
+def _seed_values(character: Character | None, state_change: CharacterStateChange) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "appearance": None,
+        "personality": None,
+        "identity": character.canonical_name if character is not None else None,
+        "motivation": None,
+        "relationship_summary": None,
+        "visual_keywords": [],
+        "negative_prompt": None,
+    }
+    for change in state_change.changed_fields or []:
+        field = change.get("field")
+        before = change.get("before")
+        if field == "visual_keywords" and isinstance(before, list) and all(isinstance(item, str) for item in before):
+            values[field] = before
+        elif field in values and field != "visual_keywords" and (before is None or isinstance(before, str)):
+            values[field] = before
+    if not values["identity"] and character is not None:
+        values["identity"] = character.canonical_name
+    return values
 
 
 def _load_reusable_review_decisions(root: Path) -> dict[str, dict[str, Any]]:
@@ -384,6 +458,7 @@ def _empty_summary(options: FullAutoPipelineOptions, *, total_chapters: int) -> 
         "low_confidence_remaining_count": 0,
         "synthesized_state_count": 0,
         "auto_confirmed_state_count": 0,
+        "seeded_state_count": 0,
         "per_character_state_count": {},
         "per_character_latest_state_at_end": {},
         "chapters_with_unusually_many_events": [],
@@ -417,6 +492,7 @@ def _empty_block_summary(block_start: int, block_end: int) -> dict[str, Any]:
         "low_confidence_remaining_count": 0,
         "synthesized_state_count": 0,
         "auto_confirmed_state_count": 0,
+        "seeded_state_count": 0,
         "synthesis_failure_count": 0,
         "reviewer_failure_count": 0,
         "warnings": [],
@@ -470,6 +546,8 @@ def _count_synthesis(summary: dict[str, Any], block_summary: dict[str, Any], pay
             target["synthesized_state_count"] += 1
         if payload["confirmed"]:
             target["auto_confirmed_state_count"] += 1
+        if payload.get("seeded_state_id"):
+            target["seeded_state_count"] += 1
 
 
 def _fill_counts(
@@ -668,6 +746,7 @@ def _write_markdown_report(path: Path, summary: dict[str, Any]) -> None:
         f"- state_change_candidate_remaining_count: {summary['state_change_candidate_remaining_count']}",
         f"- synthesized_state_count: {summary['synthesized_state_count']}",
         f"- auto_confirmed_state_count: {summary['auto_confirmed_state_count']}",
+        f"- seeded_state_count: {summary['seeded_state_count']}",
         "",
         "## Quality Observations",
         "",
@@ -701,6 +780,7 @@ def parse_args(argv: list[str] | None = None) -> FullAutoPipelineOptions:
     parser.add_argument("--auto-apply-reviewer-decisions", action="store_true")
     parser.add_argument("--auto-synthesize-states", action="store_true")
     parser.add_argument("--auto-confirm-synthesized-states", action="store_true")
+    parser.add_argument("--auto-seed-missing-character-states", action="store_true")
     parser.add_argument("--confirm-threshold", type=float, default=0.85)
     parser.add_argument("--reject-threshold", type=float, default=0.9)
     parser.add_argument("--continue-on-error", action="store_true", default=True)
@@ -718,6 +798,7 @@ def parse_args(argv: list[str] | None = None) -> FullAutoPipelineOptions:
         auto_apply_reviewer_decisions=args.auto_apply_reviewer_decisions,
         auto_synthesize_states=args.auto_synthesize_states,
         auto_confirm_synthesized_states=args.auto_confirm_synthesized_states,
+        auto_seed_missing_character_states=args.auto_seed_missing_character_states,
         confirm_threshold=args.confirm_threshold,
         reject_threshold=args.reject_threshold,
         continue_on_error=args.continue_on_error,

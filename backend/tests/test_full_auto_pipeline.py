@@ -243,6 +243,152 @@ def test_full_auto_synthesis_failure_does_not_rollback_confirmed_state_change(pg
     assert result["synthesized_state_count"] == 0
 
 
+def test_full_auto_auto_seeds_missing_character_state_before_synthesis(pg_session: Session, tmp_path) -> None:
+    fixture = _create_full_auto_fixture(pg_session, with_initial_state=False)
+    event = _add_confirmed_event(pg_session, fixture, 1)
+    change = _add_confirmed_change(pg_session, fixture, 1, event)
+    provider = SequencedLlmProvider(extraction_responses=[], review_responses=[])
+
+    result = run_full_auto_pipeline(
+        pg_session,
+        FullAutoPipelineOptions(
+            novel_id=fixture.novel.id,
+            chapter_start=1,
+            chapter_end=1,
+            block_size=20,
+            auto_confirm_events=True,
+            auto_review_state_changes=True,
+            auto_apply_reviewer_decisions=True,
+            auto_synthesize_states=True,
+            auto_confirm_synthesized_states=True,
+            auto_seed_missing_character_states=True,
+            continue_on_error=True,
+            log_dir=tmp_path,
+        ),
+        extraction_provider=provider,
+        review_provider=provider,
+    )
+
+    assert result["seeded_state_count"] == 1
+    assert result["synthesized_state_count"] == 1
+    assert result["auto_confirmed_state_count"] == 1
+    states = pg_session.scalars(select(CharacterState).order_by(CharacterState.chapter_start, CharacterState.created_at)).all()
+    assert len(states) == 2
+    seed_state = states[0]
+    synthesized_state = states[1]
+    assert seed_state.state_change_id is None
+    assert seed_state.status == ReviewStatus.CONFIRMED.value
+    assert seed_state.reviewed_by == "full-auto-pipeline"
+    assert seed_state.review_note == "auto-seeded missing initial CharacterState before synthesis"
+    assert seed_state.identity in {fixture.character.canonical_name, "outer disciple"}
+    assert synthesized_state.state_change_id == change.id
+    assert synthesized_state.status == ReviewStatus.CONFIRMED.value
+
+
+def test_full_auto_seed_default_off_preserves_missing_latest_state_failure(pg_session: Session, tmp_path) -> None:
+    fixture = _create_full_auto_fixture(pg_session, with_initial_state=False)
+    event = _add_confirmed_event(pg_session, fixture, 1)
+    _add_confirmed_change(pg_session, fixture, 1, event)
+    provider = SequencedLlmProvider(extraction_responses=[], review_responses=[])
+
+    result = run_full_auto_pipeline(
+        pg_session,
+        FullAutoPipelineOptions(
+            novel_id=fixture.novel.id,
+            chapter_start=1,
+            chapter_end=1,
+            block_size=20,
+            auto_confirm_events=True,
+            auto_review_state_changes=True,
+            auto_apply_reviewer_decisions=True,
+            auto_synthesize_states=True,
+            auto_confirm_synthesized_states=True,
+            continue_on_error=True,
+            log_dir=tmp_path,
+        ),
+        extraction_provider=provider,
+        review_provider=provider,
+    )
+
+    assert result["seeded_state_count"] == 0
+    assert result["synthesis_failure_count"] == 1
+
+
+def test_full_auto_does_not_duplicate_seed_when_confirmed_state_exists(pg_session: Session, tmp_path) -> None:
+    fixture = _create_full_auto_fixture(pg_session)
+    event = _add_confirmed_event(pg_session, fixture, 1)
+    _add_confirmed_change(pg_session, fixture, 1, event)
+    provider = SequencedLlmProvider(extraction_responses=[], review_responses=[])
+
+    result = run_full_auto_pipeline(
+        pg_session,
+        FullAutoPipelineOptions(
+            novel_id=fixture.novel.id,
+            chapter_start=1,
+            chapter_end=1,
+            block_size=20,
+            auto_confirm_events=True,
+            auto_review_state_changes=True,
+            auto_apply_reviewer_decisions=True,
+            auto_synthesize_states=True,
+            auto_confirm_synthesized_states=True,
+            auto_seed_missing_character_states=True,
+            continue_on_error=True,
+            log_dir=tmp_path,
+        ),
+        extraction_provider=provider,
+        review_provider=provider,
+    )
+
+    assert result["seeded_state_count"] == 0
+
+
+def test_full_auto_does_not_duplicate_existing_seed(pg_session: Session, tmp_path) -> None:
+    fixture = _create_full_auto_fixture(pg_session, with_initial_state=False)
+    seed = CharacterState(
+        novel_id=fixture.novel.id,
+        character_id=fixture.character.id,
+        chapter_start=0,
+        chapter_end=None,
+        identity=fixture.character.canonical_name,
+        visual_keywords=[],
+        source_chapters=[1],
+        source_chunk_ids=[str(fixture.chunks[1].id)],
+        status=ReviewStatus.CONFIRMED.value,
+        reviewed_at=datetime.now(UTC),
+        reviewed_by="full-auto-pipeline",
+        review_note="auto-seeded missing initial CharacterState before synthesis",
+    )
+    pg_session.add(seed)
+    event = _add_confirmed_event(pg_session, fixture, 1)
+    _add_confirmed_change(pg_session, fixture, 1, event)
+    pg_session.commit()
+    provider = SequencedLlmProvider(extraction_responses=[], review_responses=[])
+
+    result = run_full_auto_pipeline(
+        pg_session,
+        FullAutoPipelineOptions(
+            novel_id=fixture.novel.id,
+            chapter_start=1,
+            chapter_end=1,
+            block_size=20,
+            auto_confirm_events=True,
+            auto_review_state_changes=True,
+            auto_apply_reviewer_decisions=True,
+            auto_synthesize_states=True,
+            auto_confirm_synthesized_states=True,
+            auto_seed_missing_character_states=True,
+            continue_on_error=True,
+            log_dir=tmp_path,
+        ),
+        extraction_provider=provider,
+        review_provider=provider,
+    )
+
+    assert result["seeded_state_count"] == 0
+    assert pg_session.scalar(select(func.count()).select_from(CharacterState)) == 2
+
+
 def test_full_auto_records_failed_chapter_and_continues(pg_session: Session, tmp_path) -> None:
     fixture = _create_full_auto_fixture(pg_session, chapter_count=2)
     provider = SequencedLlmProvider(
@@ -289,7 +435,12 @@ class FullAutoFixture:
         self.character = character
 
 
-def _create_full_auto_fixture(pg_session: Session, chapter_count: int = 2) -> FullAutoFixture:
+def _create_full_auto_fixture(
+    pg_session: Session,
+    chapter_count: int = 2,
+    *,
+    with_initial_state: bool = True,
+) -> FullAutoFixture:
     novel = Novel(title="Full Auto Novel", source_type="markdown", language="zh", meta={}, imported_at=datetime.now(UTC))
     pg_session.add(novel)
     pg_session.flush()
@@ -332,20 +483,21 @@ def _create_full_auto_fixture(pg_session: Session, chapter_count: int = 2) -> Fu
         pg_session.add(chunk)
         chapters.append(chapter)
         chunks[index] = chunk
-    state = CharacterState(
-        novel_id=novel.id,
-        character_id=character.id,
-        chapter_start=0,
-        chapter_end=None,
-        identity="outer disciple",
-        motivation="survive",
-        relationship_summary="alone",
-        visual_keywords=["robe"],
-        source_chapters=[0],
-        source_chunk_ids=[str(chunks[1].id)],
-        status=ReviewStatus.CONFIRMED.value,
-    )
-    pg_session.add(state)
+    if with_initial_state:
+        state = CharacterState(
+            novel_id=novel.id,
+            character_id=character.id,
+            chapter_start=0,
+            chapter_end=None,
+            identity="outer disciple",
+            motivation="survive",
+            relationship_summary="alone",
+            visual_keywords=["robe"],
+            source_chapters=[0],
+            source_chunk_ids=[str(chunks[1].id)],
+            status=ReviewStatus.CONFIRMED.value,
+        )
+        pg_session.add(state)
     pg_session.commit()
     return FullAutoFixture(novel=novel, chapters=chapters, chunks=chunks, character=character)
 

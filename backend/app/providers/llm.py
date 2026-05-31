@@ -8,6 +8,23 @@ from typing import Any, Protocol
 import httpx
 
 
+class LlmProviderResponseError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response: str | None = None,
+        parsed_response: dict[str, Any] | None = None,
+        provider_name: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
+        self.parsed_response = parsed_response
+        self.provider_name = provider_name
+        self.model = model
+
+
 class LlmProvider(Protocol):
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         ...
@@ -58,6 +75,7 @@ class FastGptLlmProvider:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.provider_name = "fastgpt"
         self.timeout = timeout
         self.json_mode = json_mode
         self.max_tokens = max_tokens
@@ -65,7 +83,15 @@ class FastGptLlmProvider:
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         parsed = self._generate_parsed_json(system_prompt, user_prompt)
-        self._validate_extraction_schema(parsed)
+        try:
+            self._validate_extraction_schema(parsed)
+        except ValueError as exc:
+            raise LlmProviderResponseError(
+                str(exc),
+                parsed_response=parsed,
+                provider_name="fastgpt",
+                model=self.model,
+            ) from exc
         return parsed
 
     def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
@@ -118,9 +144,19 @@ class FastGptLlmProvider:
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            raise ValueError("FastGPT LLM response must be valid JSON") from exc
+            raise LlmProviderResponseError(
+                "FastGPT LLM response must be valid JSON",
+                raw_response=content,
+                provider_name="fastgpt",
+                model=self.model,
+            ) from exc
         if not isinstance(parsed, dict):
-            raise ValueError("FastGPT LLM response JSON must be an object")
+            raise LlmProviderResponseError(
+                "FastGPT LLM response JSON must be an object",
+                raw_response=content,
+                provider_name="fastgpt",
+                model=self.model,
+            )
         return parsed
 
     def _validate_extraction_schema(self, parsed: dict[str, Any]) -> None:
