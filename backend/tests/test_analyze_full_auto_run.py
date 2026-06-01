@@ -69,6 +69,7 @@ def test_analyzer_links_raw_source_chunk_diagnostics(tmp_path: Path) -> None:
                     "33333333-3333-3333-3333-333333333333",
                 ],
                 "returned_character_ids": ["44444444-4444-4444-4444-444444444444"],
+                "raw_response_text": '{"events": [',
                 "prompt_hash": "abc",
             }
         ),
@@ -96,7 +97,7 @@ def test_analyzer_links_raw_source_chunk_diagnostics(tmp_path: Path) -> None:
     source_chunks = analyze_source_chunk_failures(summary, db, diagnostics)
 
     failure = extraction["failures"][0]
-    assert failure["raw_response_available"] is False
+    assert failure["raw_response_available"] is True
     assert failure["raw_parsed_response_available"] is True
     assert failure["returned_source_chunk_ids"] == [
         "22222222-2222-2222-2222-222222222222",

@@ -109,7 +109,7 @@ def load_raw_llm_diagnostics(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
             entry = {
                 **payload,
                 "raw_diagnostics_file": str(path),
-                "raw_response_available": bool(payload.get("raw_response")),
+                "raw_response_available": bool(payload.get("raw_response") or payload.get("raw_response_text")),
                 "raw_parsed_response_available": bool(
                     payload.get("raw_parsed_response")
                     or payload.get("parsed_response")
