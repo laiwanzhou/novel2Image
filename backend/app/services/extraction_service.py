@@ -5,6 +5,7 @@ from pathlib import Path
 import uuid
 
 from app.core.enums import EventType, ReviewStatus
+from app.core.config import get_settings
 from app.models.character import Character
 from app.models.novel import Chapter, ChapterChunk
 from app.models.state import CharacterEvent, CharacterStateChange
@@ -62,6 +63,7 @@ class ExtractionService:
         llm_provider: LlmProvider,
         auto_confirm_events: bool = False,
         diagnostics_dir: Path | None = None,
+        extraction_max_retries: int | None = None,
     ) -> None:
         self.state_repository = state_repository
         self.chunk_repository = chunk_repository
@@ -69,6 +71,10 @@ class ExtractionService:
         self.llm_provider = llm_provider
         self.auto_confirm_events = auto_confirm_events
         self.diagnostics_writer = RawLlmResponseDiagnosticsWriter(diagnostics_dir)
+        self.extraction_max_retries = (
+            get_settings().llm_extraction_max_retries if extraction_max_retries is None else extraction_max_retries
+        )
+        self.last_retry_count = 0
 
     def extract_chapter_candidates(self, chapter_id: uuid.UUID) -> ExtractionResult:
         chapter = self.chunk_repository.get_chapter(chapter_id)
@@ -92,21 +98,9 @@ class ExtractionService:
             provider=getattr(self.llm_provider, "provider_name", None),
             model=getattr(self.llm_provider, "model", None),
         )
+        response = self._generate_json_with_retries(system_prompt, user_prompt, diagnostics_context)
         try:
-            response = self.llm_provider.generate_json(system_prompt, user_prompt)
-            event_drafts, state_change_drafts = self._validate_response(
-                response=response,
-                allowed_chunk_ids=allowed_chunk_ids,
-            )
-        except LlmProviderResponseError as exc:
-            safe_write_raw_llm_failure(
-                self.diagnostics_writer,
-                context=diagnostics_context,
-                error=exc,
-                raw_response_text=exc.raw_response,
-                raw_parsed_response=exc.parsed_response,
-            )
-            raise
+            event_drafts, state_change_drafts = self._validate_response(response=response, allowed_chunk_ids=allowed_chunk_ids)
         except ValueError as exc:
             raw_parsed_response = locals().get("response")
             safe_write_raw_llm_failure(
@@ -114,6 +108,7 @@ class ExtractionService:
                 context=diagnostics_context,
                 error=exc,
                 raw_parsed_response=raw_parsed_response if isinstance(raw_parsed_response, dict) else None,
+                attempt=1,
             )
             raise
         return self._persist_validated_response(
@@ -121,6 +116,60 @@ class ExtractionService:
             event_drafts=event_drafts,
             state_change_drafts=state_change_drafts,
         )
+
+    def _generate_json_with_retries(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        diagnostics_context: RawLlmDiagnosticsContext,
+    ) -> dict:
+        max_attempts = max(1, self.extraction_max_retries + 1)
+        self.last_retry_count = 0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.llm_provider.generate_json(system_prompt, user_prompt)
+                self.last_retry_count = attempt - 1
+                return response
+            except Exception as exc:
+                if not self._is_retryable_generation_error(exc):
+                    if isinstance(exc, LlmProviderResponseError):
+                        safe_write_raw_llm_failure(
+                            self.diagnostics_writer,
+                            context=diagnostics_context,
+                            error=exc,
+                            raw_response_text=exc.raw_response,
+                            raw_parsed_response=exc.parsed_response,
+                            attempt=attempt,
+                        )
+                    raise
+                safe_write_raw_llm_failure(
+                    self.diagnostics_writer,
+                    context=diagnostics_context,
+                    error=exc,
+                    raw_response_text=getattr(exc, "raw_response", None),
+                    raw_parsed_response=getattr(exc, "parsed_response", None),
+                    attempt=attempt,
+                )
+                if attempt >= max_attempts:
+                    self.last_retry_count = attempt - 1
+                    raise
+        raise RuntimeError("unreachable extraction retry state")
+
+    def _is_retryable_generation_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        retryable_markers = (
+            "valid json",
+            "content is empty",
+            "ssl",
+            "eof",
+            "incomplete",
+            "request failed",
+            "timeout",
+            "timed out",
+        )
+        if isinstance(exc, LlmProviderResponseError):
+            return any(marker in message for marker in retryable_markers)
+        return any(marker in message for marker in retryable_markers)
 
     def _validate_response(
         self,

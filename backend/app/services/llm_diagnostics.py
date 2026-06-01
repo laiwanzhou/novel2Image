@@ -37,6 +37,7 @@ class RawLlmResponseDiagnosticsWriter:
         error: Exception,
         raw_response_text: str | None = None,
         raw_parsed_response: dict[str, Any] | None = None,
+        attempt: int | None = None,
     ) -> Path:
         failure_type = classify_llm_failure(error)
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -58,6 +59,11 @@ class RawLlmResponseDiagnosticsWriter:
             "returned_source_chunk_ids": _collect_values(raw_parsed_response, "source_chunk_ids"),
             "returned_character_ids": _collect_values(raw_parsed_response, "character_id"),
         }
+        if attempt is not None:
+            payload["attempt"] = attempt
+        repair_notes = getattr(error, "repair_notes", None)
+        if repair_notes:
+            payload["repair_notes"] = repair_notes
         if raw_response_text is not None:
             payload["raw_response_text"] = raw_response_text
         if raw_parsed_response is not None:
@@ -85,6 +91,7 @@ def safe_write_raw_llm_failure(
     error: Exception,
     raw_response_text: str | None = None,
     raw_parsed_response: dict[str, Any] | None = None,
+    attempt: int | None = None,
 ) -> None:
     if writer is None:
         return
@@ -94,6 +101,7 @@ def safe_write_raw_llm_failure(
             error=error,
             raw_response_text=raw_response_text,
             raw_parsed_response=raw_parsed_response,
+            attempt=attempt,
         )
     except Exception:
         return

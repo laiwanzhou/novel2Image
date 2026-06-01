@@ -16,6 +16,25 @@ from app.repositories.states import StateRepository
 from app.services.extraction_service import ExtractionService
 
 
+class FailingThenSuccessProvider:
+    provider_name = "fastgpt"
+    model = "test-model"
+
+    def __init__(self, *, failures: list[Exception], response: dict) -> None:
+        self.failures = failures
+        self.response = response
+        self.calls = 0
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return self.response
+
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict:
+        raise NotImplementedError
+
+
 def test_fake_llm_extraction_persists_candidate_event_and_state_change(pg_session: Session) -> None:
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
     provider = FakeLlmProvider(
@@ -210,6 +229,7 @@ def test_extraction_diagnostics_write_raw_provider_response_for_invalid_json(
         character_repository=CharacterRepository(pg_session),
         llm_provider=provider,
         diagnostics_dir=tmp_path,
+        extraction_max_retries=0,
     )
 
     with pytest.raises(ValueError, match="valid JSON"):
@@ -330,6 +350,108 @@ def test_extraction_diagnostics_write_failure_does_not_mask_original_error(pg_se
 
     with pytest.raises(ValueError, match="current chapter"):
         service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_retries_invalid_json_then_persists_once(pg_session: Session, tmp_path) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FailingThenSuccessProvider(
+        failures=[
+            LlmProviderResponseError(
+                "FastGPT LLM response must be valid JSON",
+                raw_response='{"events": [',
+                provider_name="fastgpt",
+                model="deepseek-v4-pro",
+            )
+        ],
+        response=_valid_extraction_response(fixture),
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        diagnostics_dir=tmp_path,
+        extraction_max_retries=1,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 2
+    assert len(result.events) == 1
+    assert _count_rows(pg_session, CharacterEvent) == 1
+    assert _count_rows(pg_session, CharacterStateChange) == 1
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "invalid_json"
+    assert payload["attempt"] == 1
+    assert payload["raw_response_text"] == '{"events": ['
+
+
+def test_extraction_retry_count_is_limited(pg_session: Session, tmp_path) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FailingThenSuccessProvider(
+        failures=[
+            LlmProviderResponseError("FastGPT LLM response must be valid JSON", raw_response='{"events": ['),
+            LlmProviderResponseError("FastGPT LLM response must be valid JSON", raw_response='{"events": ['),
+        ],
+        response=_valid_extraction_response(fixture),
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        diagnostics_dir=tmp_path,
+        extraction_max_retries=1,
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 2
+    assert _count_rows(pg_session, CharacterEvent) == 0
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(tmp_path.glob("*.json"))]
+    assert [payload["attempt"] for payload in payloads] == [1, 2]
+
+
+def test_extraction_does_not_retry_source_chunk_validation_error(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk = _create_outside_chapter_chunk(pg_session, fixture.novel.id)
+    response = _valid_extraction_response(fixture)
+    response["events"][0]["source_chunk_ids"] = [str(outside_chunk.id)]
+    provider = FailingThenSuccessProvider(failures=[], response=response)
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        extraction_max_retries=1,
+    )
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 1
+    assert _count_rows(pg_session, CharacterEvent) == 0
+
+
+def test_extraction_does_not_retry_invalid_character_validation_error(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    response = _valid_extraction_response(fixture)
+    response["events"][0]["character_id"] = "00000000-0000-0000-0000-000000000999"
+    provider = FailingThenSuccessProvider(failures=[], response=response)
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        extraction_max_retries=1,
+    )
+
+    with pytest.raises(ValueError, match="confirmed character"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 1
+    assert _count_rows(pg_session, CharacterEvent) == 0
 
 
 def test_extraction_rejects_state_change_without_source_chunks(pg_session: Session) -> None:
@@ -1012,6 +1134,40 @@ def _create_extraction_fixture(pg_session: Session, character_status: str) -> Ex
         )
     pg_session.commit()
     return ExtractionFixture(novel=novel, chapter=chapter, chunk=chunk, character=character)
+
+
+def _valid_extraction_response(fixture: ExtractionFixture) -> dict:
+    return {
+        "events": [
+            {
+                "character_id": str(fixture.character.id),
+                "event_summary": "Lin Qing joins the inner sect.",
+                "event_type": "identity",
+                "is_long_term_change": True,
+                "affected_fields": ["identity"],
+                "source_chunk_ids": [str(fixture.chunk.id)],
+                "confidence": 0.92,
+                "explanation": "The chapter explicitly says the sect accepted him.",
+            }
+        ],
+        "state_changes": [
+            {
+                "character_id": str(fixture.character.id),
+                "event_index": 0,
+                "changed_fields": [
+                    {
+                        "field": "identity",
+                        "before": "outer disciple",
+                        "after": "inner disciple",
+                        "source_chunk_ids": [str(fixture.chunk.id)],
+                    }
+                ],
+                "source_chunk_ids": [str(fixture.chunk.id)],
+                "confidence": 0.9,
+                "explanation": "Identity changes from outer disciple to inner disciple.",
+            }
+        ],
+    }
 
 
 def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk:

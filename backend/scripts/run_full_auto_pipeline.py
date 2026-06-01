@@ -54,6 +54,7 @@ class FullAutoPipelineOptions:
     auto_seed_missing_character_states: bool = False
     confirm_threshold: float = 0.85
     reject_threshold: float = 0.9
+    extraction_max_retries: int | None = None
     continue_on_error: bool = True
     force_reextract: bool = False
     log_dir: Path = Path(".pipeline-runs/full-auto")
@@ -102,13 +103,15 @@ def run_full_auto_pipeline(
                     block_summary["skipped_extraction_chapters"].append(chapter.chapter_index)
                     _append_log(chapter_log, {"type": "skipped_extraction", "chapter_index": chapter.chapter_index})
                 else:
-                    extraction = ExtractionService(
+                    extraction_service = ExtractionService(
                         state_repository=state_repository,
                         chunk_repository=chunk_repository,
                         character_repository=character_repository,
                         llm_provider=extraction_provider,
                         auto_confirm_events=options.auto_confirm_events,
-                    ).extract_chapter_candidates(chapter.id)
+                        extraction_max_retries=options.extraction_max_retries,
+                    )
+                    extraction = extraction_service.extract_chapter_candidates(chapter.id)
                     new_events = [event for event in extraction.events if event.id not in before_event_ids]
                     new_changes = [change for change in extraction.state_changes if change.id not in before_change_ids]
                     _count_created(summary, block_summary, new_events, new_changes)
@@ -119,6 +122,7 @@ def run_full_auto_pipeline(
                             "chapter_index": chapter.chapter_index,
                             "event_ids": [str(event.id) for event in new_events],
                             "state_change_ids": [str(change.id) for change in new_changes],
+                            "retry_count": extraction_service.last_retry_count,
                         },
                     )
 
@@ -820,6 +824,7 @@ def parse_args(argv: list[str] | None = None) -> FullAutoPipelineOptions:
     parser.add_argument("--auto-seed-missing-character-states", action="store_true")
     parser.add_argument("--confirm-threshold", type=float, default=0.85)
     parser.add_argument("--reject-threshold", type=float, default=0.9)
+    parser.add_argument("--extraction-max-retries", type=int)
     parser.add_argument("--continue-on-error", action="store_true", default=True)
     parser.add_argument("--stop-on-error", dest="continue_on_error", action="store_false")
     parser.add_argument("--force-reextract", action="store_true")
@@ -838,6 +843,7 @@ def parse_args(argv: list[str] | None = None) -> FullAutoPipelineOptions:
         auto_seed_missing_character_states=args.auto_seed_missing_character_states,
         confirm_threshold=args.confirm_threshold,
         reject_threshold=args.reject_threshold,
+        extraction_max_retries=args.extraction_max_retries,
         continue_on_error=args.continue_on_error,
         force_reextract=args.force_reextract,
         log_dir=args.log_dir,
