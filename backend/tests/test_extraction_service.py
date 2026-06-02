@@ -209,6 +209,129 @@ def test_extraction_rejects_event_with_chunk_outside_current_chapter(pg_session:
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
+def test_extraction_normalizes_single_character_source_chunk_typo(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    typo_chunk_id = _replace_first_hex_char(str(fixture.chunk.id))
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [typo_chunk_id],
+                    "confidence": 0.92,
+                    "explanation": "The chapter explicitly says the sect accepted him.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "identity",
+                            "before": "outer disciple",
+                            "after": "inner disciple",
+                            "source_chunk_ids": [typo_chunk_id],
+                        }
+                    ],
+                    "source_chunk_ids": [typo_chunk_id],
+                    "confidence": 0.9,
+                    "explanation": "Identity changes from outer disciple to inner disciple.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    expected_chunk_id = str(fixture.chunk.id)
+    assert result.events[0].source_chunk_ids == [expected_chunk_id]
+    assert result.state_changes[0].source_chunk_ids == [expected_chunk_id]
+    assert result.state_changes[0].changed_fields[0]["source_chunk_ids"] == [expected_chunk_id]
+    assert "original_source_chunk_id=" in result.events[0].explanation
+    assert "normalized_source_chunk_id=" in result.events[0].explanation
+    assert "original_source_chunk_id=" in result.state_changes[0].explanation
+    assert result.state_changes[0].changed_fields[0]["original_source_chunk_ids"] == [typo_chunk_id]
+    assert result.state_changes[0].changed_fields[0]["normalized_source_chunk_ids"] == [expected_chunk_id]
+    assert service.last_normalized_source_chunk_ids == [
+        {
+            "label": "event",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": expected_chunk_id,
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        },
+        {
+            "label": "state_change",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": expected_chunk_id,
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        },
+        {
+            "label": "changed_field",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": expected_chunk_id,
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        },
+    ]
+
+
+def test_extraction_rejects_source_chunk_typo_distance_greater_than_one(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    typo_chunk_id = _replace_first_two_hex_chars(str(fixture.chunk.id))
+    service = _service_with_event_source_chunk(pg_session, fixture, typo_chunk_id)
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_ambiguous_near_match_source_chunk_typo(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    original_chunk_id = str(fixture.chunk.id)
+    typo_chunk_id = _replace_first_hex_char(original_chunk_id, replacement="f")
+    changed_index = next(index for index, char in enumerate(original_chunk_id) if char != typo_chunk_id[index])
+    ambiguous_chunk_id = _replace_next_hex_char(typo_chunk_id, skip_index=changed_index)
+    ambiguous_chunk = _add_current_chapter_chunk_with_id(
+        pg_session,
+        fixture,
+        chunk_id=ambiguous_chunk_id,
+        chunk_index=2,
+    )
+    assert _uuid_distance(typo_chunk_id, original_chunk_id) == 1
+    assert _uuid_distance(typo_chunk_id, str(ambiguous_chunk.id)) == 1
+    service = _service_with_event_source_chunk(pg_session, fixture, typo_chunk_id)
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_does_not_normalize_real_chunk_id_from_other_chapter(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk_id = _replace_first_hex_char(str(fixture.chunk.id))
+    _create_outside_chapter_chunk(pg_session, fixture.novel.id, chunk_id=outside_chunk_id)
+    service = _service_with_event_source_chunk(pg_session, fixture, outside_chunk_id)
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_non_uuid_source_chunk_without_normalizing(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    service = _service_with_event_source_chunk(pg_session, fixture, "not-a-uuid")
+
+    with pytest.raises(ValueError, match="valid chunk UUIDs"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
 def test_extraction_diagnostics_write_raw_provider_response_for_invalid_json(
     pg_session: Session,
     tmp_path,
@@ -1197,7 +1320,7 @@ def _valid_extraction_response(fixture: ExtractionFixture) -> dict:
     }
 
 
-def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk:
+def _create_outside_chapter_chunk(pg_session: Session, novel_id, *, chunk_id=None) -> ChapterChunk:
     chapter = Chapter(
         novel_id=novel_id,
         chapter_index=4,
@@ -1210,6 +1333,7 @@ def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk
     pg_session.add(chapter)
     pg_session.flush()
     chunk = ChapterChunk(
+        id=chunk_id,
         novel_id=novel_id,
         chapter_id=chapter.id,
         chapter_index=4,
@@ -1225,6 +1349,94 @@ def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk
     pg_session.add(chunk)
     pg_session.commit()
     return chunk
+
+
+def _add_current_chapter_chunk_with_id(
+    pg_session: Session,
+    fixture: ExtractionFixture,
+    *,
+    chunk_id: str,
+    chunk_index: int,
+) -> ChapterChunk:
+    chunk = ChapterChunk(
+        id=chunk_id,
+        novel_id=fixture.novel.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=fixture.chapter.chapter_index,
+        chunk_index=chunk_index,
+        text="Additional current chapter evidence.",
+        start_char=43,
+        end_char=78,
+        char_count=35,
+        token_count=35,
+        checksum=f"chunk-3-{chunk_index}",
+        meta={},
+    )
+    pg_session.add(chunk)
+    pg_session.commit()
+    return chunk
+
+
+def _service_with_event_source_chunk(
+    pg_session: Session,
+    fixture: ExtractionFixture,
+    source_chunk_id: str,
+) -> ExtractionService:
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [source_chunk_id],
+                }
+            ],
+            "state_changes": [],
+        }
+    )
+    return ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+
+def _replace_first_hex_char(value: str, *, replacement: str = "0") -> str:
+    chars = list(value)
+    for index, char in enumerate(chars):
+        if char == "-":
+            continue
+        if char != replacement:
+            chars[index] = replacement
+            return "".join(chars)
+    chars[0] = "1"
+    return "".join(chars)
+
+
+def _replace_next_hex_char(value: str, *, skip_index: int, replacement: str = "0") -> str:
+    chars = list(value)
+    for index, char in enumerate(chars):
+        if index == skip_index or char == "-":
+            continue
+        if char != replacement:
+            chars[index] = replacement
+            return "".join(chars)
+    chars[0 if skip_index != 0 else 1] = "1"
+    return "".join(chars)
+
+
+def _replace_first_two_hex_chars(value: str) -> str:
+    first = _replace_first_hex_char(value, replacement="0")
+    changed_index = next(index for index, char in enumerate(value) if char != first[index])
+    return _replace_next_hex_char(first, skip_index=changed_index, replacement="1")
+
+
+def _uuid_distance(left: str, right: str) -> int:
+    return sum(1 for a, b in zip(left, right, strict=True) if a != b)
 
 
 def _create_other_novel_chunk(pg_session: Session) -> ChapterChunk:

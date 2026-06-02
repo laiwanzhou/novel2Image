@@ -158,6 +158,7 @@ def analyze_run(run_dir: Path, *, database_url: str | None = None) -> dict[str, 
     extraction = analyze_extraction_failures(summary, chapter_logs, db, raw_diagnostics)
     source_chunks = analyze_source_chunk_failures(summary, db, raw_diagnostics)
     characters = analyze_character_reference_failures(summary, db, raw_diagnostics)
+    unsynthesized = analyze_unsynthesized_confirmed_state_changes(db)
     quality = analyze_quality(summary, mojibake, synthesis, extraction, source_chunks, characters)
 
     _write_report_pair(
@@ -186,6 +187,11 @@ def analyze_run(run_dir: Path, *, database_url: str | None = None) -> dict[str, 
         render_character_reference_markdown(characters),
     )
     _write_report_pair(
+        diagnostics_dir / "unsynthesized_confirmed_state_changes",
+        unsynthesized,
+        render_unsynthesized_markdown(unsynthesized),
+    )
+    _write_report_pair(
         diagnostics_dir / "full_auto_quality_analysis",
         quality,
         render_quality_markdown(quality),
@@ -196,6 +202,7 @@ def analyze_run(run_dir: Path, *, database_url: str | None = None) -> dict[str, 
         "extraction": extraction,
         "source_chunks": source_chunks,
         "characters": characters,
+        "unsynthesized_confirmed_state_changes": unsynthesized,
         "quality": quality,
         "diagnostics_dir": str(diagnostics_dir),
     }
@@ -436,6 +443,85 @@ def analyze_character_reference_failures(
     }
 
 
+def analyze_unsynthesized_confirmed_state_changes(db) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for change in db.unsynthesized_confirmed_state_changes():
+        changed_fields = change.get("changed_fields") or []
+        if isinstance(changed_fields, str):
+            try:
+                changed_fields = json.loads(changed_fields)
+            except json.JSONDecodeError:
+                changed_fields = []
+        if not changed_fields:
+            items.append(_unsynthesized_item(change, field=None, after_value=None))
+            continue
+        for field_change in changed_fields:
+            if not isinstance(field_change, dict):
+                continue
+            items.append(
+                _unsynthesized_item(
+                    change,
+                    field=field_change.get("field"),
+                    after_value=field_change.get("after"),
+                )
+            )
+    return {
+        "count": len(items),
+        "items": items,
+        "suggested_action_distribution": dict(Counter(item["suggested_action"] for item in items)),
+    }
+
+
+def _unsynthesized_item(change: dict[str, Any], *, field: str | None, after_value: Any) -> dict[str, Any]:
+    future_state = change.get("future_state") or {}
+    future_values = change.get("future_state_values") or future_state
+    future_value = future_values.get(field) if field else None
+    coverage = _future_state_coverage(after_value, future_value)
+    return {
+        "state_change_id": change.get("state_change_id"),
+        "character_id": change.get("character_id"),
+        "character_name": change.get("character_name"),
+        "chapter_index": change.get("chapter_index"),
+        "field": field,
+        "after_value_summary": _value_summary(after_value),
+        "blocking_future_state_id": change.get("future_state_id") or future_state.get("id"),
+        "future_state_id": change.get("future_state_id") or future_state.get("id"),
+        "future_state_chapter_index": change.get("future_state_chapter_index") or future_state.get("chapter_start"),
+        "future_state_value": future_value,
+        "future_state_value_summary": _value_summary(future_value),
+        "coverage": coverage,
+        "suggested_action": coverage,
+    }
+
+
+def _future_state_coverage(after_value: Any, future_value: Any) -> str:
+    if future_value in (None, "", []):
+        return "needs_timeline_rebuild"
+    after_text = _value_text(after_value)
+    future_text = _value_text(future_value)
+    if not after_text:
+        return "needs_human_review"
+    if after_text in future_text or future_text in after_text:
+        return "already_covered_by_future_state"
+    after_tokens = {token for token in after_text.replace("，", " ").replace(",", " ").split() if token}
+    future_tokens = {token for token in future_text.replace("，", " ").replace(",", " ").split() if token}
+    if after_tokens and len(after_tokens.intersection(future_tokens)) >= max(1, len(after_tokens) // 2):
+        return "superseded_by_future_state"
+    return "conflicts_with_future_state"
+
+
+def _value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _value_summary(value: Any) -> str:
+    return _snippet(_value_text(value), 240)
+
+
 def analyze_quality(
     summary: dict[str, Any],
     mojibake: dict[str, Any],
@@ -500,6 +586,9 @@ class NullDatabaseInspector:
 
     def character_id_info(self, character_id: str) -> dict[str, Any]:
         return {"id": character_id, "exists": None, "status": None, "confirmed": None}
+
+    def unsynthesized_confirmed_state_changes(self) -> list[dict[str, Any]]:
+        return []
 
 
 class DatabaseInspector:
@@ -692,6 +781,50 @@ class DatabaseInspector:
             "confirmed": row["status"] == "confirmed",
         }
 
+    def unsynthesized_confirmed_state_changes(self) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            rows = session.execute(
+                text(
+                    """
+                    select sc.id::text as state_change_id,
+                           sc.character_id::text as character_id,
+                           c.canonical_name as character_name,
+                           sc.chapter_index,
+                           sc.changed_fields_json as changed_fields,
+                           future_state.id::text as future_state_id,
+                           future_state.chapter_start as future_state_chapter_index,
+                           jsonb_build_object(
+                             'appearance', future_state.appearance,
+                             'personality', future_state.personality,
+                             'identity', future_state.identity,
+                             'motivation', future_state.motivation,
+                             'relationship_summary', future_state.relationship_summary,
+                             'visual_keywords', future_state.visual_keywords,
+                             'negative_prompt', future_state.negative_prompt
+                           ) as future_state_values
+                    from character_state_changes sc
+                    left join characters c on c.id = sc.character_id
+                    left join lateral (
+                        select cs.*
+                        from character_states cs
+                        where cs.character_id = sc.character_id
+                          and cs.status = 'confirmed'
+                          and cs.chapter_start > sc.chapter_index
+                        order by cs.chapter_start asc, cs.created_at asc
+                        limit 1
+                    ) future_state on true
+                    where sc.status = 'confirmed'
+                      and not exists (
+                        select 1
+                        from character_states synthesized
+                        where synthesized.state_change_id = sc.id
+                      )
+                    order by sc.chapter_index, sc.id
+                    """
+                )
+            ).mappings()
+            return [dict(row) for row in rows]
+
 
 def _write_report_pair(base_path: Path, payload: dict[str, Any], markdown: str) -> None:
     base_path.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -784,6 +917,25 @@ def render_quality_markdown(data: dict[str, Any]) -> str:
     lines.extend(f"- {item}" for item in data["biggest_bottlenecks"])
     lines.append("\n## Minimal Fix Order")
     lines.extend(f"{index}. {item}" for index, item in enumerate(data["minimal_fix_order"], start=1))
+    return "\n".join(lines) + "\n"
+
+
+def render_unsynthesized_markdown(data: dict[str, Any]) -> str:
+    lines = [
+        "# Unsynthesized Confirmed State Changes",
+        "",
+        f"- count: {data['count']}",
+        "",
+        "## Suggested Action Distribution",
+    ]
+    lines.extend(f"- {key}: {value}" for key, value in data["suggested_action_distribution"].items())
+    lines.append("\n## Items")
+    for item in data["items"]:
+        lines.append(
+            f"- chapter {item['chapter_index']} `{item['state_change_id']}` "
+            f"{item['character_name']} {item['field']}: {item['suggested_action']} "
+            f"(future state {item['future_state_id']} at {item['future_state_chapter_index']})"
+        )
     return "\n".join(lines) + "\n"
 
 

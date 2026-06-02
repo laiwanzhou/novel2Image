@@ -23,6 +23,13 @@ from app.services.state_service import STATE_FIELDS, normalize_visual_keywords
 
 ALLOWED_EVENT_TYPES = tuple(event_type.value for event_type in EventType)
 ALLOWED_EVENT_TYPES_TEXT = ", ".join(ALLOWED_EVENT_TYPES)
+SOURCE_CHUNK_NORMALIZATION_REASON = "single-character source_chunk_id typo normalized within current chapter"
+
+
+@dataclass(frozen=True)
+class SourceChunkValidation:
+    source_chunk_ids: list[str]
+    normalizations: list[dict[str, str]]
 
 
 @dataclass(frozen=True)
@@ -40,6 +47,7 @@ class EventDraft:
     is_long_term_change: bool
     affected_fields: list
     source_chunk_ids: list[str]
+    source_chunk_normalizations: list[dict[str, str]]
     confidence: float | None
     explanation: str | None
 
@@ -50,6 +58,7 @@ class StateChangeDraft:
     event_index: int | None
     changed_fields: list[dict]
     source_chunk_ids: list[str]
+    source_chunk_normalizations: list[dict[str, str]]
     confidence: float | None
     explanation: str | None
 
@@ -77,6 +86,7 @@ class ExtractionService:
         )
         self.last_retry_count = 0
         self.last_normalized_event_types: list[dict[str, str | int]] = []
+        self.last_normalized_source_chunk_ids: list[dict[str, str]] = []
 
     def extract_chapter_candidates(self, chapter_id: uuid.UUID) -> ExtractionResult:
         chapter = self.chunk_repository.get_chapter(chapter_id)
@@ -186,8 +196,9 @@ class ExtractionService:
 
         event_drafts: list[EventDraft] = []
         self.last_normalized_event_types = []
+        self.last_normalized_source_chunk_ids = []
         for raw_event in raw_events:
-            source_chunk_ids = self._require_source_chunks(raw_event, "event", allowed_chunk_ids)
+            source_chunks = self._require_source_chunks(raw_event, "event", allowed_chunk_ids)
             character = self._require_confirmed_character(raw_event.get("character_id"))
             event_type, original_event_type = self._normalized_event_type(raw_event)
             if original_event_type is not None:
@@ -207,7 +218,8 @@ class ExtractionService:
                     original_event_type=original_event_type,
                     is_long_term_change=bool(raw_event.get("is_long_term_change", False)),
                     affected_fields=list(raw_event.get("affected_fields", [])),
-                    source_chunk_ids=source_chunk_ids,
+                    source_chunk_ids=source_chunks.source_chunk_ids,
+                    source_chunk_normalizations=source_chunks.normalizations,
                     confidence=raw_event.get("confidence"),
                     explanation=raw_event.get("explanation"),
                 )
@@ -215,20 +227,21 @@ class ExtractionService:
 
         state_change_drafts: list[StateChangeDraft] = []
         for raw_change in raw_state_changes:
-            source_chunk_ids = self._require_source_chunks(raw_change, "state_change", allowed_chunk_ids)
+            source_chunks = self._require_source_chunks(raw_change, "state_change", allowed_chunk_ids)
             character = self._require_confirmed_character(raw_change.get("character_id"))
             event_index = self._validated_event_index(raw_change, event_drafts)
             if event_index is None:
                 raise ValueError("state_change requires event_index referencing a long-term event")
             if not event_drafts[event_index].is_long_term_change:
                 raise ValueError("state_change event_index must reference an event with is_long_term_change=true")
-            changed_fields = self._require_changed_fields(raw_change, allowed_chunk_ids)
+            changed_fields, changed_field_normalizations = self._require_changed_fields(raw_change, allowed_chunk_ids)
             state_change_drafts.append(
                 StateChangeDraft(
                     character_id=character.id,
                     event_index=event_index,
                     changed_fields=changed_fields,
-                    source_chunk_ids=source_chunk_ids,
+                    source_chunk_ids=source_chunks.source_chunk_ids,
+                    source_chunk_normalizations=source_chunks.normalizations + changed_field_normalizations,
                     confidence=raw_change.get("confidence"),
                     explanation=self._require_state_change_explanation(raw_change),
                 )
@@ -278,7 +291,7 @@ class ExtractionService:
                     changed_fields=draft.changed_fields,
                     source_chunk_ids=draft.source_chunk_ids,
                     confidence=draft.confidence,
-                    explanation=draft.explanation,
+                    explanation=self._state_change_explanation_with_normalization_note(draft),
                     status=ReviewStatus.CANDIDATE.value,
                 )
                 state_changes.append(self.state_repository.add_state_change(state_change))
@@ -303,20 +316,47 @@ class ExtractionService:
             raise ValueError("Extraction output must reference a confirmed character")
         return character
 
-    def _require_source_chunks(self, raw: dict, label: str, allowed_chunk_ids: set[str]) -> list[str]:
+    def _require_source_chunks(self, raw: dict, label: str, allowed_chunk_ids: set[str]) -> SourceChunkValidation:
         source_chunk_ids = raw.get("source_chunk_ids")
         if not isinstance(source_chunk_ids, list) or not source_chunk_ids:
             raise ValueError(f"{label} requires non-empty source_chunk_ids")
         parsed_ids: list[str] = []
+        normalizations: list[dict[str, str]] = []
         for chunk_id in source_chunk_ids:
             try:
-                parsed_id = str(uuid.UUID(str(chunk_id)))
+                parsed_uuid = uuid.UUID(str(chunk_id))
+                parsed_id = str(parsed_uuid)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{label} source_chunk_ids must contain valid chunk UUIDs") from exc
             if parsed_id not in allowed_chunk_ids:
-                raise ValueError(f"{label} source_chunk_ids must reference chunks from the current chapter")
+                normalized = self._normalize_source_chunk_typo(parsed_uuid, label, allowed_chunk_ids)
+                normalizations.append(normalized)
+                parsed_id = normalized["normalized_source_chunk_id"]
             parsed_ids.append(parsed_id)
-        return parsed_ids
+        return SourceChunkValidation(source_chunk_ids=parsed_ids, normalizations=normalizations)
+
+    def _normalize_source_chunk_typo(
+        self,
+        parsed_uuid: uuid.UUID,
+        label: str,
+        allowed_chunk_ids: set[str],
+    ) -> dict[str, str]:
+        parsed_id = str(parsed_uuid)
+        if self.chunk_repository.session.get(ChapterChunk, parsed_uuid) is not None:
+            raise ValueError(f"{label} source_chunk_ids must reference chunks from the current chapter")
+        candidates = [
+            chunk_id for chunk_id in sorted(allowed_chunk_ids) if _uuid_string_distance(parsed_id, chunk_id) == 1
+        ]
+        if len(candidates) != 1:
+            raise ValueError(f"{label} source_chunk_ids must reference chunks from the current chapter")
+        normalization = {
+            "label": label,
+            "original_source_chunk_id": parsed_id,
+            "normalized_source_chunk_id": candidates[0],
+            "reason": SOURCE_CHUNK_NORMALIZATION_REASON,
+        }
+        self.last_normalized_source_chunk_ids.append(normalization)
+        return normalization
 
     def _require_string(self, raw: dict, field: str) -> str:
         value = raw.get(field)
@@ -347,31 +387,55 @@ class ExtractionService:
         return synonym_map.get(event_type, EventType.OTHER.value), str(raw_event_type)
 
     def _event_explanation_with_normalization_note(self, draft: EventDraft) -> str | None:
-        if draft.original_event_type is None:
+        notes: list[str] = []
+        if draft.original_event_type is not None:
+            notes.append(
+                "event_type normalized by extraction service: "
+                f"original_event_type={draft.original_event_type}; normalized_event_type={draft.event_type}."
+            )
+        notes.extend(_source_chunk_normalization_notes(draft.source_chunk_normalizations))
+        if not notes:
             return draft.explanation
-        note = (
-            "event_type normalized by extraction service: "
-            f"original_event_type={draft.original_event_type}; normalized_event_type={draft.event_type}."
-        )
         if draft.explanation:
-            return f"{note} {draft.explanation}"
-        return note
+            return f"{' '.join(notes)} {draft.explanation}"
+        return " ".join(notes)
 
-    def _require_changed_fields(self, raw_change: dict, allowed_chunk_ids: set[str]) -> list[dict]:
+    def _state_change_explanation_with_normalization_note(self, draft: StateChangeDraft) -> str | None:
+        notes = _source_chunk_normalization_notes(draft.source_chunk_normalizations)
+        if not notes:
+            return draft.explanation
+        if draft.explanation:
+            return f"{' '.join(notes)} {draft.explanation}"
+        return " ".join(notes)
+
+    def _require_changed_fields(self, raw_change: dict, allowed_chunk_ids: set[str]) -> tuple[list[dict], list[dict[str, str]]]:
         changed_fields = raw_change.get("changed_fields")
         if not isinstance(changed_fields, list) or not changed_fields:
             raise ValueError("state_change requires non-empty changed_fields")
+        normalized_fields: list[dict] = []
+        all_normalizations: list[dict[str, str]] = []
         for change in changed_fields:
             if not isinstance(change, dict) or "field" not in change or "after" not in change:
                 raise ValueError("Each changed field requires field and after")
+            normalized_change = dict(change)
             if change["field"] not in STATE_FIELDS:
                 raise ValueError(f"Invalid changed field from LLM: {change['field']}")
             if change["field"] == "visual_keywords":
-                change["after"] = normalize_visual_keywords(change.get("after")) or []
+                normalized_change["after"] = normalize_visual_keywords(change.get("after")) or []
                 if "before" in change:
-                    change["before"] = normalize_visual_keywords(change.get("before")) or []
-            change["source_chunk_ids"] = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
-        return changed_fields
+                    normalized_change["before"] = normalize_visual_keywords(change.get("before")) or []
+            source_chunks = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
+            normalized_change["source_chunk_ids"] = source_chunks.source_chunk_ids
+            if source_chunks.normalizations:
+                normalized_change["original_source_chunk_ids"] = [
+                    item["original_source_chunk_id"] for item in source_chunks.normalizations
+                ]
+                normalized_change["normalized_source_chunk_ids"] = [
+                    item["normalized_source_chunk_id"] for item in source_chunks.normalizations
+                ]
+            all_normalizations.extend(source_chunks.normalizations)
+            normalized_fields.append(normalized_change)
+        return normalized_fields, all_normalizations
 
     def _require_state_change_explanation(self, raw_change: dict) -> str:
         explanation = raw_change.get("explanation")
@@ -472,3 +536,18 @@ Rules:
             "Use the following chapter payload as evidence:\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
+
+
+def _uuid_string_distance(left: str, right: str) -> int:
+    if len(left) != len(right):
+        return max(len(left), len(right))
+    return sum(1 for left_char, right_char in zip(left, right, strict=True) if left_char != right_char)
+
+
+def _source_chunk_normalization_notes(normalizations: list[dict[str, str]]) -> list[str]:
+    return [
+        "source_chunk_id normalized by extraction service: "
+        f"original_source_chunk_id={item['original_source_chunk_id']}; "
+        f"normalized_source_chunk_id={item['normalized_source_chunk_id']}."
+        for item in normalizations
+    ]

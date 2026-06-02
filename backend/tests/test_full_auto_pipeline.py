@@ -149,6 +149,65 @@ def test_full_auto_logs_normalized_event_types(pg_session: Session, tmp_path) ->
     ]
 
 
+def test_full_auto_logs_normalized_source_chunk_ids(pg_session: Session, tmp_path) -> None:
+    fixture = _create_full_auto_fixture(pg_session)
+    typo_chunk_id = _replace_first_hex_char(str(fixture.chunks[1].id))
+    provider = SequencedLlmProvider(
+        extraction_responses=[
+            {
+                "events": [
+                    {
+                        "character_id": str(fixture.character.id),
+                        "event_summary": "Lin Qing changes in chapter 1.",
+                        "event_type": "identity",
+                        "is_long_term_change": True,
+                        "affected_fields": ["identity"],
+                        "source_chunk_ids": [typo_chunk_id],
+                        "confidence": 0.9,
+                        "explanation": "The chapter supports a durable change.",
+                    }
+                ],
+                "state_changes": [],
+            }
+        ],
+        review_responses=[],
+    )
+
+    result = run_full_auto_pipeline(
+        pg_session,
+        FullAutoPipelineOptions(
+            novel_id=fixture.novel.id,
+            chapter_start=1,
+            chapter_end=1,
+            block_size=20,
+            auto_confirm_events=True,
+            auto_review_state_changes=True,
+            auto_apply_reviewer_decisions=True,
+            auto_synthesize_states=True,
+            auto_confirm_synthesized_states=True,
+            continue_on_error=True,
+            log_dir=tmp_path,
+        ),
+        extraction_provider=provider,
+        review_provider=provider,
+    )
+
+    assert result["failed_chapters"] == []
+    event = pg_session.scalar(select(CharacterEvent))
+    assert event.source_chunk_ids == [str(fixture.chunks[1].id)]
+    assert "original_source_chunk_id=" in event.explanation
+    chapter_log = (tmp_path / "chapter-0001.jsonl").read_text(encoding="utf-8")
+    extraction_payload = json.loads(chapter_log.splitlines()[0])
+    assert extraction_payload["normalized_source_chunk_ids"] == [
+        {
+            "label": "event",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": str(fixture.chunks[1].id),
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        }
+    ]
+
+
 def test_full_auto_applies_rejects_but_leaves_needs_human_and_low_confidence_candidate(
     pg_session: Session,
     tmp_path,
@@ -710,3 +769,15 @@ def _extraction_response(fixture: FullAutoFixture, chapter_index: int) -> dict:
             }
         ],
     }
+
+
+def _replace_first_hex_char(value: str, *, replacement: str = "0") -> str:
+    chars = list(value)
+    for index, char in enumerate(chars):
+        if char == "-":
+            continue
+        if char != replacement:
+            chars[index] = replacement
+            return "".join(chars)
+    chars[0] = "1"
+    return "".join(chars)

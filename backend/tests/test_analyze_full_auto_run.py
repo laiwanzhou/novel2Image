@@ -11,6 +11,7 @@ from scripts.analyze_full_auto_run import (
     contains_mojibake,
     iter_jsonl,
     load_raw_llm_diagnostics,
+    analyze_unsynthesized_confirmed_state_changes,
     scan_json_strings,
 )
 
@@ -165,6 +166,41 @@ def test_analyzer_links_raw_character_reference_diagnostics(tmp_path: Path) -> N
     assert characters["limitation"] is None
 
 
+def test_analyzer_reports_unsynthesized_confirmed_state_change_future_blocker() -> None:
+    db = FakeDiagnosticsDb(
+        unsynthesized_changes=[
+            {
+                "state_change_id": "11111111-1111-1111-1111-111111111111",
+                "character_name": "Samael",
+                "chapter_index": 127,
+                "changed_fields": [
+                    {
+                        "field": "identity",
+                        "after": "recognized leader",
+                    }
+                ],
+                "future_state": {
+                    "id": "22222222-2222-2222-2222-222222222222",
+                    "chapter_start": 132,
+                    "identity": "recognized leader of the knight order",
+                },
+            }
+        ]
+    )
+
+    result = analyze_unsynthesized_confirmed_state_changes(db)
+
+    assert result["count"] == 1
+    item = result["items"][0]
+    assert item["state_change_id"] == "11111111-1111-1111-1111-111111111111"
+    assert item["field"] == "identity"
+    assert item["future_state_id"] == "22222222-2222-2222-2222-222222222222"
+    assert item["future_state_chapter_index"] == 132
+    assert item["future_state_value"] == "recognized leader of the knight order"
+    assert item["coverage"] == "already_covered_by_future_state"
+    assert item["suggested_action"] == "already_covered_by_future_state"
+
+
 class FakeDiagnosticsDb(NullDatabaseInspector):
     def __init__(
         self,
@@ -172,10 +208,12 @@ class FakeDiagnosticsDb(NullDatabaseInspector):
         current_chunk_ids: list[str] | None = None,
         chunk_lookup: dict[str, dict] | None = None,
         character_lookup: dict[str, dict] | None = None,
+        unsynthesized_changes: list[dict] | None = None,
     ) -> None:
         self.current_chunk_ids = current_chunk_ids or []
         self.chunk_lookup = chunk_lookup or {}
         self.character_lookup = character_lookup or {}
+        self.unsynthesized_changes = unsynthesized_changes or []
 
     def chunk_ids_for_chapter(self, chapter_id: str) -> list[str]:
         return self.current_chunk_ids
@@ -191,3 +229,6 @@ class FakeDiagnosticsDb(NullDatabaseInspector):
             "status": value["status"],
             "confirmed": value["status"] == "confirmed",
         }
+
+    def unsynthesized_confirmed_state_changes(self) -> list[dict]:
+        return self.unsynthesized_changes
