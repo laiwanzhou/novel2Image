@@ -123,6 +123,7 @@ def run_full_auto_pipeline(
                             "event_ids": [str(event.id) for event in new_events],
                             "state_change_ids": [str(change.id) for change in new_changes],
                             "retry_count": extraction_service.last_retry_count,
+                            "normalized_event_types": extraction_service.last_normalized_event_types,
                         },
                     )
 

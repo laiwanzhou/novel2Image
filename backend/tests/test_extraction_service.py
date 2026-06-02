@@ -656,21 +656,48 @@ def test_extraction_blocks_unconfirmed_character_from_candidate_outputs(pg_sessi
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
-def test_extraction_rejects_invalid_event_type_before_persisting(pg_session: Session) -> None:
+def test_extraction_normalizes_unknown_event_type_before_persisting(pg_session: Session) -> None:
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
-    service = _service_for_event_type(pg_session, fixture, "decision")
+    service = _service_for_event_type(pg_session, fixture, "discovery")
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            "Invalid event_type from LLM: decision. Allowed values: "
-            "appearance, identity, relationship, motivation, other"
-        ),
-    ):
-        service.extract_chapter_candidates(fixture.chapter.id)
+    result = service.extract_chapter_candidates(fixture.chapter.id)
 
     pg_session.flush()
-    assert _count_rows(pg_session, CharacterEvent) == 0
+    assert _count_rows(pg_session, CharacterEvent) == 1
+    assert result.events[0].event_type == "other"
+    assert "original_event_type=discovery" in result.events[0].explanation
+    assert "normalized_event_type=other" in result.events[0].explanation
+    assert service.last_normalized_event_types == [
+        {
+            "event_index": 0,
+            "original_event_type": "discovery",
+            "normalized_event_type": "other",
+            "reason": "unknown LLM event_type normalized before persistence",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [
+        ("decision", "motivation"),
+        ("alliance", "relationship"),
+        ("conflict", "other"),
+        ("unexpected_custom_type", "other"),
+    ],
+)
+def test_extraction_normalizes_common_event_type_synonyms(
+    pg_session: Session,
+    event_type: str,
+    expected: str,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    service = _service_for_event_type(pg_session, fixture, event_type)
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert result.events[0].event_type == expected
+    assert f"original_event_type={event_type}" in result.events[0].explanation
 
 
 @pytest.mark.parametrize("event_type", ["motivation", "other"])

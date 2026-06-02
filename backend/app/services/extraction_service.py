@@ -36,6 +36,7 @@ class EventDraft:
     character_id: uuid.UUID
     event_summary: str
     event_type: str
+    original_event_type: str | None
     is_long_term_change: bool
     affected_fields: list
     source_chunk_ids: list[str]
@@ -75,6 +76,7 @@ class ExtractionService:
             get_settings().llm_extraction_max_retries if extraction_max_retries is None else extraction_max_retries
         )
         self.last_retry_count = 0
+        self.last_normalized_event_types: list[dict[str, str | int]] = []
 
     def extract_chapter_candidates(self, chapter_id: uuid.UUID) -> ExtractionResult:
         chapter = self.chunk_repository.get_chapter(chapter_id)
@@ -183,14 +185,26 @@ class ExtractionService:
             raise ValueError("LLM extraction response must contain events and state_changes lists")
 
         event_drafts: list[EventDraft] = []
+        self.last_normalized_event_types = []
         for raw_event in raw_events:
             source_chunk_ids = self._require_source_chunks(raw_event, "event", allowed_chunk_ids)
             character = self._require_confirmed_character(raw_event.get("character_id"))
+            event_type, original_event_type = self._normalized_event_type(raw_event)
+            if original_event_type is not None:
+                self.last_normalized_event_types.append(
+                    {
+                        "event_index": len(event_drafts),
+                        "original_event_type": original_event_type,
+                        "normalized_event_type": event_type,
+                        "reason": "unknown LLM event_type normalized before persistence",
+                    }
+                )
             event_drafts.append(
                 EventDraft(
                     character_id=character.id,
                     event_summary=self._require_string(raw_event, "event_summary"),
-                    event_type=self._require_event_type(raw_event),
+                    event_type=event_type,
+                    original_event_type=original_event_type,
                     is_long_term_change=bool(raw_event.get("is_long_term_change", False)),
                     affected_fields=list(raw_event.get("affected_fields", [])),
                     source_chunk_ids=source_chunk_ids,
@@ -244,7 +258,7 @@ class ExtractionService:
                     affected_fields=draft.affected_fields,
                     source_chunk_ids=draft.source_chunk_ids,
                     confidence=draft.confidence,
-                    explanation=draft.explanation,
+                    explanation=self._event_explanation_with_normalization_note(draft),
                     status=event_status,
                     reviewed_at=datetime.now(UTC) if self.auto_confirm_events else None,
                     reviewed_by="auto-extraction" if self.auto_confirm_events else None,
@@ -310,13 +324,38 @@ class ExtractionService:
             raise ValueError(f"Extraction output requires string field: {field}")
         return value
 
-    def _require_event_type(self, raw_event: dict) -> str:
-        event_type = raw_event.get("event_type", EventType.OTHER.value)
-        if event_type not in ALLOWED_EVENT_TYPES:
-            raise ValueError(
-                f"Invalid event_type from LLM: {event_type}. Allowed values: {ALLOWED_EVENT_TYPES_TEXT}"
-            )
-        return event_type
+    def _normalized_event_type(self, raw_event: dict) -> tuple[str, str | None]:
+        raw_event_type = raw_event.get("event_type", EventType.OTHER.value)
+        event_type = str(raw_event_type).strip().lower() if raw_event_type is not None else EventType.OTHER.value
+        if event_type in ALLOWED_EVENT_TYPES:
+            return event_type, None
+        synonym_map = {
+            "discovery": EventType.OTHER.value,
+            "realization": EventType.OTHER.value,
+            "revelation": EventType.OTHER.value,
+            "action": EventType.OTHER.value,
+            "battle": EventType.OTHER.value,
+            "conflict": EventType.OTHER.value,
+            "dialogue": EventType.OTHER.value,
+            "encounter": EventType.OTHER.value,
+            "decision": EventType.MOTIVATION.value,
+            "choice": EventType.MOTIVATION.value,
+            "alliance": EventType.RELATIONSHIP.value,
+            "cooperation": EventType.RELATIONSHIP.value,
+            "partnership": EventType.RELATIONSHIP.value,
+        }
+        return synonym_map.get(event_type, EventType.OTHER.value), str(raw_event_type)
+
+    def _event_explanation_with_normalization_note(self, draft: EventDraft) -> str | None:
+        if draft.original_event_type is None:
+            return draft.explanation
+        note = (
+            "event_type normalized by extraction service: "
+            f"original_event_type={draft.original_event_type}; normalized_event_type={draft.event_type}."
+        )
+        if draft.explanation:
+            return f"{note} {draft.explanation}"
+        return note
 
     def _require_changed_fields(self, raw_change: dict, allowed_chunk_ids: set[str]) -> list[dict]:
         changed_fields = raw_change.get("changed_fields")
