@@ -1,21 +1,35 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 import uuid
 
 from app.core.enums import EventType, ReviewStatus
+from app.core.config import get_settings
 from app.models.character import Character
 from app.models.novel import Chapter, ChapterChunk
 from app.models.state import CharacterEvent, CharacterStateChange
-from app.providers.llm import LlmProvider
+from app.providers.llm import LlmProvider, LlmProviderResponseError
 from app.repositories.characters import CharacterRepository
 from app.repositories.chunks import ChunkRepository
 from app.repositories.states import StateRepository
-from app.services.state_service import STATE_FIELDS
+from app.services.llm_diagnostics import (
+    RawLlmDiagnosticsContext,
+    RawLlmResponseDiagnosticsWriter,
+    safe_write_raw_llm_failure,
+)
+from app.services.state_service import STATE_FIELDS, normalize_visual_keywords
 
 
 ALLOWED_EVENT_TYPES = tuple(event_type.value for event_type in EventType)
 ALLOWED_EVENT_TYPES_TEXT = ", ".join(ALLOWED_EVENT_TYPES)
+SOURCE_CHUNK_NORMALIZATION_REASON = "single-character source_chunk_id typo normalized within current chapter"
+
+
+@dataclass(frozen=True)
+class SourceChunkValidation:
+    source_chunk_ids: list[str]
+    normalizations: list[dict[str, str]]
 
 
 @dataclass(frozen=True)
@@ -29,9 +43,11 @@ class EventDraft:
     character_id: uuid.UUID
     event_summary: str
     event_type: str
+    original_event_type: str | None
     is_long_term_change: bool
     affected_fields: list
     source_chunk_ids: list[str]
+    source_chunk_normalizations: list[dict[str, str]]
     confidence: float | None
     explanation: str | None
 
@@ -42,6 +58,7 @@ class StateChangeDraft:
     event_index: int | None
     changed_fields: list[dict]
     source_chunk_ids: list[str]
+    source_chunk_normalizations: list[dict[str, str]]
     confidence: float | None
     explanation: str | None
 
@@ -55,12 +72,21 @@ class ExtractionService:
         character_repository: CharacterRepository,
         llm_provider: LlmProvider,
         auto_confirm_events: bool = False,
+        diagnostics_dir: Path | None = None,
+        extraction_max_retries: int | None = None,
     ) -> None:
         self.state_repository = state_repository
         self.chunk_repository = chunk_repository
         self.character_repository = character_repository
         self.llm_provider = llm_provider
         self.auto_confirm_events = auto_confirm_events
+        self.diagnostics_writer = RawLlmResponseDiagnosticsWriter(diagnostics_dir)
+        self.extraction_max_retries = (
+            get_settings().llm_extraction_max_retries if extraction_max_retries is None else extraction_max_retries
+        )
+        self.last_retry_count = 0
+        self.last_normalized_event_types: list[dict[str, str | int]] = []
+        self.last_normalized_source_chunk_ids: list[dict[str, str]] = []
 
     def extract_chapter_candidates(self, chapter_id: uuid.UUID) -> ExtractionResult:
         chapter = self.chunk_repository.get_chapter(chapter_id)
@@ -68,19 +94,94 @@ class ExtractionService:
             raise ValueError(f"Chapter not found: {chapter_id}")
         chunks = self.chunk_repository.list_chunks_for_chapter(chapter_id)
         allowed_chunk_ids = {str(chunk.id) for chunk in chunks}
-        response = self.llm_provider.generate_json(
-            self._system_prompt(),
-            self._user_prompt(chapter=chapter, chunks=chunks),
+        confirmed_characters = self.character_repository.list_characters(
+            chapter.novel_id,
+            ReviewStatus.CONFIRMED.value,
         )
-        event_drafts, state_change_drafts = self._validate_response(
-            response=response,
-            allowed_chunk_ids=allowed_chunk_ids,
+        system_prompt = self._system_prompt()
+        user_prompt = self._user_prompt(chapter=chapter, chunks=chunks, confirmed_characters=confirmed_characters)
+        diagnostics_context = RawLlmDiagnosticsContext(
+            chapter_id=chapter.id,
+            chapter_index=chapter.chapter_index,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            allowed_current_chapter_chunk_ids=sorted(allowed_chunk_ids),
+            confirmed_character_ids=sorted(str(character.id) for character in confirmed_characters),
+            provider=getattr(self.llm_provider, "provider_name", None),
+            model=getattr(self.llm_provider, "model", None),
         )
+        response = self._generate_json_with_retries(system_prompt, user_prompt, diagnostics_context)
+        try:
+            event_drafts, state_change_drafts = self._validate_response(response=response, allowed_chunk_ids=allowed_chunk_ids)
+        except ValueError as exc:
+            raw_parsed_response = locals().get("response")
+            safe_write_raw_llm_failure(
+                self.diagnostics_writer,
+                context=diagnostics_context,
+                error=exc,
+                raw_parsed_response=raw_parsed_response if isinstance(raw_parsed_response, dict) else None,
+                attempt=1,
+            )
+            raise
         return self._persist_validated_response(
             chapter=chapter,
             event_drafts=event_drafts,
             state_change_drafts=state_change_drafts,
         )
+
+    def _generate_json_with_retries(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        diagnostics_context: RawLlmDiagnosticsContext,
+    ) -> dict:
+        max_attempts = max(1, self.extraction_max_retries + 1)
+        self.last_retry_count = 0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.llm_provider.generate_json(system_prompt, user_prompt)
+                self.last_retry_count = attempt - 1
+                return response
+            except Exception as exc:
+                if not self._is_retryable_generation_error(exc):
+                    if isinstance(exc, LlmProviderResponseError):
+                        safe_write_raw_llm_failure(
+                            self.diagnostics_writer,
+                            context=diagnostics_context,
+                            error=exc,
+                            raw_response_text=exc.raw_response,
+                            raw_parsed_response=exc.parsed_response,
+                            attempt=attempt,
+                        )
+                    raise
+                safe_write_raw_llm_failure(
+                    self.diagnostics_writer,
+                    context=diagnostics_context,
+                    error=exc,
+                    raw_response_text=getattr(exc, "raw_response", None),
+                    raw_parsed_response=getattr(exc, "parsed_response", None),
+                    attempt=attempt,
+                )
+                if attempt >= max_attempts:
+                    self.last_retry_count = attempt - 1
+                    raise
+        raise RuntimeError("unreachable extraction retry state")
+
+    def _is_retryable_generation_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        retryable_markers = (
+            "valid json",
+            "content is empty",
+            "ssl",
+            "eof",
+            "incomplete",
+            "request failed",
+            "timeout",
+            "timed out",
+        )
+        if isinstance(exc, LlmProviderResponseError):
+            return any(marker in message for marker in retryable_markers)
+        return any(marker in message for marker in retryable_markers)
 
     def _validate_response(
         self,
@@ -94,17 +195,31 @@ class ExtractionService:
             raise ValueError("LLM extraction response must contain events and state_changes lists")
 
         event_drafts: list[EventDraft] = []
+        self.last_normalized_event_types = []
+        self.last_normalized_source_chunk_ids = []
         for raw_event in raw_events:
-            source_chunk_ids = self._require_source_chunks(raw_event, "event", allowed_chunk_ids)
+            source_chunks = self._require_source_chunks(raw_event, "event", allowed_chunk_ids)
             character = self._require_confirmed_character(raw_event.get("character_id"))
+            event_type, original_event_type = self._normalized_event_type(raw_event)
+            if original_event_type is not None:
+                self.last_normalized_event_types.append(
+                    {
+                        "event_index": len(event_drafts),
+                        "original_event_type": original_event_type,
+                        "normalized_event_type": event_type,
+                        "reason": "unknown LLM event_type normalized before persistence",
+                    }
+                )
             event_drafts.append(
                 EventDraft(
                     character_id=character.id,
                     event_summary=self._require_string(raw_event, "event_summary"),
-                    event_type=self._require_event_type(raw_event),
+                    event_type=event_type,
+                    original_event_type=original_event_type,
                     is_long_term_change=bool(raw_event.get("is_long_term_change", False)),
                     affected_fields=list(raw_event.get("affected_fields", [])),
-                    source_chunk_ids=source_chunk_ids,
+                    source_chunk_ids=source_chunks.source_chunk_ids,
+                    source_chunk_normalizations=source_chunks.normalizations,
                     confidence=raw_event.get("confidence"),
                     explanation=raw_event.get("explanation"),
                 )
@@ -112,20 +227,21 @@ class ExtractionService:
 
         state_change_drafts: list[StateChangeDraft] = []
         for raw_change in raw_state_changes:
-            source_chunk_ids = self._require_source_chunks(raw_change, "state_change", allowed_chunk_ids)
+            source_chunks = self._require_source_chunks(raw_change, "state_change", allowed_chunk_ids)
             character = self._require_confirmed_character(raw_change.get("character_id"))
             event_index = self._validated_event_index(raw_change, event_drafts)
             if event_index is None:
                 raise ValueError("state_change requires event_index referencing a long-term event")
             if not event_drafts[event_index].is_long_term_change:
                 raise ValueError("state_change event_index must reference an event with is_long_term_change=true")
-            changed_fields = self._require_changed_fields(raw_change, allowed_chunk_ids)
+            changed_fields, changed_field_normalizations = self._require_changed_fields(raw_change, allowed_chunk_ids)
             state_change_drafts.append(
                 StateChangeDraft(
                     character_id=character.id,
                     event_index=event_index,
                     changed_fields=changed_fields,
-                    source_chunk_ids=source_chunk_ids,
+                    source_chunk_ids=source_chunks.source_chunk_ids,
+                    source_chunk_normalizations=source_chunks.normalizations + changed_field_normalizations,
                     confidence=raw_change.get("confidence"),
                     explanation=self._require_state_change_explanation(raw_change),
                 )
@@ -155,7 +271,7 @@ class ExtractionService:
                     affected_fields=draft.affected_fields,
                     source_chunk_ids=draft.source_chunk_ids,
                     confidence=draft.confidence,
-                    explanation=draft.explanation,
+                    explanation=self._event_explanation_with_normalization_note(draft),
                     status=event_status,
                     reviewed_at=datetime.now(UTC) if self.auto_confirm_events else None,
                     reviewed_by="auto-extraction" if self.auto_confirm_events else None,
@@ -175,7 +291,7 @@ class ExtractionService:
                     changed_fields=draft.changed_fields,
                     source_chunk_ids=draft.source_chunk_ids,
                     confidence=draft.confidence,
-                    explanation=draft.explanation,
+                    explanation=self._state_change_explanation_with_normalization_note(draft),
                     status=ReviewStatus.CANDIDATE.value,
                 )
                 state_changes.append(self.state_repository.add_state_change(state_change))
@@ -200,20 +316,47 @@ class ExtractionService:
             raise ValueError("Extraction output must reference a confirmed character")
         return character
 
-    def _require_source_chunks(self, raw: dict, label: str, allowed_chunk_ids: set[str]) -> list[str]:
+    def _require_source_chunks(self, raw: dict, label: str, allowed_chunk_ids: set[str]) -> SourceChunkValidation:
         source_chunk_ids = raw.get("source_chunk_ids")
         if not isinstance(source_chunk_ids, list) or not source_chunk_ids:
             raise ValueError(f"{label} requires non-empty source_chunk_ids")
         parsed_ids: list[str] = []
+        normalizations: list[dict[str, str]] = []
         for chunk_id in source_chunk_ids:
             try:
-                parsed_id = str(uuid.UUID(str(chunk_id)))
+                parsed_uuid = uuid.UUID(str(chunk_id))
+                parsed_id = str(parsed_uuid)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{label} source_chunk_ids must contain valid chunk UUIDs") from exc
             if parsed_id not in allowed_chunk_ids:
-                raise ValueError(f"{label} source_chunk_ids must reference chunks from the current chapter")
+                normalized = self._normalize_source_chunk_typo(parsed_uuid, label, allowed_chunk_ids)
+                normalizations.append(normalized)
+                parsed_id = normalized["normalized_source_chunk_id"]
             parsed_ids.append(parsed_id)
-        return parsed_ids
+        return SourceChunkValidation(source_chunk_ids=parsed_ids, normalizations=normalizations)
+
+    def _normalize_source_chunk_typo(
+        self,
+        parsed_uuid: uuid.UUID,
+        label: str,
+        allowed_chunk_ids: set[str],
+    ) -> dict[str, str]:
+        parsed_id = str(parsed_uuid)
+        if self.chunk_repository.session.get(ChapterChunk, parsed_uuid) is not None:
+            raise ValueError(f"{label} source_chunk_ids must reference chunks from the current chapter")
+        candidates = [
+            chunk_id for chunk_id in sorted(allowed_chunk_ids) if _uuid_string_distance(parsed_id, chunk_id) == 1
+        ]
+        if len(candidates) != 1:
+            raise ValueError(f"{label} source_chunk_ids must reference chunks from the current chapter")
+        normalization = {
+            "label": label,
+            "original_source_chunk_id": parsed_id,
+            "normalized_source_chunk_id": candidates[0],
+            "reason": SOURCE_CHUNK_NORMALIZATION_REASON,
+        }
+        self.last_normalized_source_chunk_ids.append(normalization)
+        return normalization
 
     def _require_string(self, raw: dict, field: str) -> str:
         value = raw.get(field)
@@ -221,25 +364,78 @@ class ExtractionService:
             raise ValueError(f"Extraction output requires string field: {field}")
         return value
 
-    def _require_event_type(self, raw_event: dict) -> str:
-        event_type = raw_event.get("event_type", EventType.OTHER.value)
-        if event_type not in ALLOWED_EVENT_TYPES:
-            raise ValueError(
-                f"Invalid event_type from LLM: {event_type}. Allowed values: {ALLOWED_EVENT_TYPES_TEXT}"
-            )
-        return event_type
+    def _normalized_event_type(self, raw_event: dict) -> tuple[str, str | None]:
+        raw_event_type = raw_event.get("event_type", EventType.OTHER.value)
+        event_type = str(raw_event_type).strip().lower() if raw_event_type is not None else EventType.OTHER.value
+        if event_type in ALLOWED_EVENT_TYPES:
+            return event_type, None
+        synonym_map = {
+            "discovery": EventType.OTHER.value,
+            "realization": EventType.OTHER.value,
+            "revelation": EventType.OTHER.value,
+            "action": EventType.OTHER.value,
+            "battle": EventType.OTHER.value,
+            "conflict": EventType.OTHER.value,
+            "dialogue": EventType.OTHER.value,
+            "encounter": EventType.OTHER.value,
+            "decision": EventType.MOTIVATION.value,
+            "choice": EventType.MOTIVATION.value,
+            "alliance": EventType.RELATIONSHIP.value,
+            "cooperation": EventType.RELATIONSHIP.value,
+            "partnership": EventType.RELATIONSHIP.value,
+        }
+        return synonym_map.get(event_type, EventType.OTHER.value), str(raw_event_type)
 
-    def _require_changed_fields(self, raw_change: dict, allowed_chunk_ids: set[str]) -> list[dict]:
+    def _event_explanation_with_normalization_note(self, draft: EventDraft) -> str | None:
+        notes: list[str] = []
+        if draft.original_event_type is not None:
+            notes.append(
+                "event_type normalized by extraction service: "
+                f"original_event_type={draft.original_event_type}; normalized_event_type={draft.event_type}."
+            )
+        notes.extend(_source_chunk_normalization_notes(draft.source_chunk_normalizations))
+        if not notes:
+            return draft.explanation
+        if draft.explanation:
+            return f"{' '.join(notes)} {draft.explanation}"
+        return " ".join(notes)
+
+    def _state_change_explanation_with_normalization_note(self, draft: StateChangeDraft) -> str | None:
+        notes = _source_chunk_normalization_notes(draft.source_chunk_normalizations)
+        if not notes:
+            return draft.explanation
+        if draft.explanation:
+            return f"{' '.join(notes)} {draft.explanation}"
+        return " ".join(notes)
+
+    def _require_changed_fields(self, raw_change: dict, allowed_chunk_ids: set[str]) -> tuple[list[dict], list[dict[str, str]]]:
         changed_fields = raw_change.get("changed_fields")
         if not isinstance(changed_fields, list) or not changed_fields:
             raise ValueError("state_change requires non-empty changed_fields")
+        normalized_fields: list[dict] = []
+        all_normalizations: list[dict[str, str]] = []
         for change in changed_fields:
             if not isinstance(change, dict) or "field" not in change or "after" not in change:
                 raise ValueError("Each changed field requires field and after")
+            normalized_change = dict(change)
             if change["field"] not in STATE_FIELDS:
                 raise ValueError(f"Invalid changed field from LLM: {change['field']}")
-            change["source_chunk_ids"] = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
-        return changed_fields
+            if change["field"] == "visual_keywords":
+                normalized_change["after"] = normalize_visual_keywords(change.get("after")) or []
+                if "before" in change:
+                    normalized_change["before"] = normalize_visual_keywords(change.get("before")) or []
+            source_chunks = self._require_source_chunks(change, "changed_field", allowed_chunk_ids)
+            normalized_change["source_chunk_ids"] = source_chunks.source_chunk_ids
+            if source_chunks.normalizations:
+                normalized_change["original_source_chunk_ids"] = [
+                    item["original_source_chunk_id"] for item in source_chunks.normalizations
+                ]
+                normalized_change["normalized_source_chunk_ids"] = [
+                    item["normalized_source_chunk_id"] for item in source_chunks.normalizations
+                ]
+            all_normalizations.extend(source_chunks.normalizations)
+            normalized_fields.append(normalized_change)
+        return normalized_fields, all_normalizations
 
     def _require_state_change_explanation(self, raw_change: dict) -> str:
         explanation = raw_change.get("explanation")
@@ -303,11 +499,13 @@ Rules:
 - Do not invent facts that are not supported by source chunks.
 """.strip()
 
-    def _user_prompt(self, *, chapter: Chapter, chunks: list[ChapterChunk]) -> str:
-        confirmed_characters = self.character_repository.list_characters(
-            chapter.novel_id,
-            ReviewStatus.CONFIRMED.value,
-        )
+    def _user_prompt(
+        self,
+        *,
+        chapter: Chapter,
+        chunks: list[ChapterChunk],
+        confirmed_characters: list[Character],
+    ) -> str:
         payload = {
             "chapter": {
                 "id": str(chapter.id),
@@ -338,3 +536,18 @@ Rules:
             "Use the following chapter payload as evidence:\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
+
+
+def _uuid_string_distance(left: str, right: str) -> int:
+    if len(left) != len(right):
+        return max(len(left), len(right))
+    return sum(1 for left_char, right_char in zip(left, right, strict=True) if left_char != right_char)
+
+
+def _source_chunk_normalization_notes(normalizations: list[dict[str, str]]) -> list[str]:
+    return [
+        "source_chunk_id normalized by extraction service: "
+        f"original_source_chunk_id={item['original_source_chunk_id']}; "
+        f"normalized_source_chunk_id={item['normalized_source_chunk_id']}."
+        for item in normalizations
+    ]

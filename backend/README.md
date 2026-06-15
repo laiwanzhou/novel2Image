@@ -61,6 +61,7 @@ NOVEL_VIS_LLM_MODEL=
 NOVEL_VIS_LLM_JSON_MODE=true
 NOVEL_VIS_LLM_MAX_TOKENS=4096
 NOVEL_VIS_LLM_TIMEOUT_SECONDS=180
+NOVEL_VIS_LLM_EXTRACTION_MAX_RETRIES=1
 NOVEL_VIS_EXTRACTION_AUTO_CONFIRM_EVENTS=false
 NOVEL_VIS_LLM_REVIEW_ENABLED=false
 NOVEL_VIS_LLM_REVIEW_AUTO_APPLY=false
@@ -168,6 +169,8 @@ When `NOVEL_VIS_LLM_JSON_MODE=true`, the request body includes:
 ```
 
 `NOVEL_VIS_LLM_MAX_TOKENS` is also sent as `max_tokens`. For DeepSeek JSON Output, keep JSON mode enabled and keep the prompt's explicit `json` instructions and output example. JSON mode does not replace backend validation: empty content, non-JSON content, truncated JSON, missing schema fields, missing chunk evidence, or invalid IDs still fail with `ValueError`.
+
+Extraction can retry transient provider failures with `NOVEL_VIS_LLM_EXTRACTION_MAX_RETRIES` or the full-auto script's `--extraction-max-retries`. Retries are limited to invalid JSON, empty content, and transport-style failures; validation failures such as wrong `source_chunk_ids` or unconfirmed `character_id` are not retried.
 
 Expected model output is strict JSON:
 

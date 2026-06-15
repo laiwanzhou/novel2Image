@@ -276,7 +276,7 @@ def test_failed_state_confirmation_leaves_session_state_unchanged(pg_session) ->
     assert candidate.status == ReviewStatus.CANDIDATE.value
 
 
-def test_synthesize_candidate_validates_visual_keywords_type(pg_session) -> None:
+def test_synthesize_candidate_normalizes_visual_keywords_string(pg_session) -> None:
     novel, character, chapter = _create_state_fixture(pg_session)
     repository = StateRepository(pg_session)
     service = StateService(repository)
@@ -295,14 +295,21 @@ def test_synthesize_candidate_validates_visual_keywords_type(pg_session) -> None
             event_id=None,
             chapter_id=chapter.id,
             chapter_index=3,
-            changed_fields=[{"field": "visual_keywords", "before": ["green robe"], "after": "red robe"}],
+                changed_fields=[
+                    {
+                        "field": "visual_keywords",
+                        "before": ["green robe"],
+                        "after": "red robe, iron sword、moonlight",
+                    }
+                ],
             source_chunk_ids=["chunk-3"],
             status=ReviewStatus.CANDIDATE.value,
         )
     )
 
-    with pytest.raises(ValueError, match="visual_keywords"):
-        service.synthesize_candidate_from_change(state_change.id)
+    state = service.synthesize_candidate_from_change(state_change.id)
+
+    assert state.visual_keywords == ["red robe", "iron sword", "moonlight"]
 
 
 def test_synthesize_candidate_validates_text_field_type(pg_session) -> None:

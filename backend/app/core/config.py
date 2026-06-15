@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     llm_json_mode: bool = True
     llm_max_tokens: int = 4096
     llm_timeout_seconds: float = 180.0
+    llm_extraction_max_retries: int = 1
     extraction_auto_confirm_events: bool = False
     llm_review_enabled: bool = False
     llm_review_auto_apply: bool = False
