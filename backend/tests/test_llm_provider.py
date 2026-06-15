@@ -1,6 +1,55 @@
 import pytest
 
-from app.providers.llm import FastGptLlmProvider, get_llm_provider
+from app.providers.llm import FastGptLlmProvider, get_llm_provider, repair_json_content
+
+
+def test_repair_json_content_accepts_plain_json_object() -> None:
+    repaired, notes = repair_json_content('{"events": [], "state_changes": []}')
+
+    assert repaired == '{"events": [], "state_changes": []}'
+    assert notes == []
+
+
+def test_repair_json_content_extracts_markdown_fenced_json() -> None:
+    repaired, notes = repair_json_content('```json\n{"events": [], "state_changes": []}\n```')
+
+    assert repaired == '{"events": [], "state_changes": []}'
+    assert notes == ["stripped_code_fence"]
+
+
+def test_repair_json_content_extracts_object_from_surrounding_text() -> None:
+    repaired, notes = repair_json_content('Here is json:\n{"events": [{"text": "a { brace }"}], "state_changes": []}\nDone.')
+
+    assert repaired == '{"events": [{"text": "a { brace }"}], "state_changes": []}'
+    assert notes == ["extracted_json_object", "removed_surrounding_text"]
+
+
+def test_repair_json_content_handles_nested_objects_and_arrays() -> None:
+    repaired, _ = repair_json_content('prefix {"events": [{"nested": {"ok": true}}], "state_changes": []} suffix')
+
+    assert repaired == '{"events": [{"nested": {"ok": true}}], "state_changes": []}'
+
+
+def test_repair_json_content_rejects_truncated_json() -> None:
+    with pytest.raises(ValueError, match="complete JSON object"):
+        repair_json_content('{"events": [{"event_summary": "unfinished')
+
+
+def test_repair_json_content_rejects_multiple_top_level_objects() -> None:
+    with pytest.raises(ValueError, match="multiple JSON objects"):
+        repair_json_content('{"events": [], "state_changes": []} {"events": [], "state_changes": []}')
+
+
+def test_repair_json_content_rejects_non_object_json() -> None:
+    provider = FastGptLlmProvider(
+        api_base="https://fastgpt.example.com/api",
+        api_key="test-key",
+        model="workflow-model",
+        post_json=lambda url, *, headers, payload, timeout: {"choices": [{"message": {"content": "[]"}}]},
+    )
+
+    with pytest.raises(ValueError, match="JSON must be an object"):
+        provider.generate_json("system", "user")
 
 
 def test_fastgpt_provider_posts_openai_compatible_chat_completion_request() -> None:

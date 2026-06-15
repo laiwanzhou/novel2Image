@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -8,11 +9,30 @@ from app.core.enums import ReviewStatus
 from app.models.character import Character
 from app.models.novel import Chapter, ChapterChunk, Novel
 from app.models.state import CharacterEvent, CharacterState, CharacterStateChange
-from app.providers.llm import FakeLlmProvider
+from app.providers.llm import FakeLlmProvider, LlmProviderResponseError
 from app.repositories.chunks import ChunkRepository
 from app.repositories.characters import CharacterRepository
 from app.repositories.states import StateRepository
 from app.services.extraction_service import ExtractionService
+
+
+class FailingThenSuccessProvider:
+    provider_name = "fastgpt"
+    model = "test-model"
+
+    def __init__(self, *, failures: list[Exception], response: dict) -> None:
+        self.failures = failures
+        self.response = response
+        self.calls = 0
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return self.response
+
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict:
+        raise NotImplementedError
 
 
 def test_fake_llm_extraction_persists_candidate_event_and_state_change(pg_session: Session) -> None:
@@ -187,6 +207,374 @@ def test_extraction_rejects_event_with_chunk_outside_current_chapter(pg_session:
 
     with pytest.raises(ValueError, match="current chapter"):
         service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_normalizes_single_character_source_chunk_typo(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    typo_chunk_id = _replace_first_hex_char(str(fixture.chunk.id))
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [typo_chunk_id],
+                    "confidence": 0.92,
+                    "explanation": "The chapter explicitly says the sect accepted him.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "identity",
+                            "before": "outer disciple",
+                            "after": "inner disciple",
+                            "source_chunk_ids": [typo_chunk_id],
+                        }
+                    ],
+                    "source_chunk_ids": [typo_chunk_id],
+                    "confidence": 0.9,
+                    "explanation": "Identity changes from outer disciple to inner disciple.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    expected_chunk_id = str(fixture.chunk.id)
+    assert result.events[0].source_chunk_ids == [expected_chunk_id]
+    assert result.state_changes[0].source_chunk_ids == [expected_chunk_id]
+    assert result.state_changes[0].changed_fields[0]["source_chunk_ids"] == [expected_chunk_id]
+    assert "original_source_chunk_id=" in result.events[0].explanation
+    assert "normalized_source_chunk_id=" in result.events[0].explanation
+    assert "original_source_chunk_id=" in result.state_changes[0].explanation
+    assert result.state_changes[0].changed_fields[0]["original_source_chunk_ids"] == [typo_chunk_id]
+    assert result.state_changes[0].changed_fields[0]["normalized_source_chunk_ids"] == [expected_chunk_id]
+    assert service.last_normalized_source_chunk_ids == [
+        {
+            "label": "event",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": expected_chunk_id,
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        },
+        {
+            "label": "state_change",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": expected_chunk_id,
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        },
+        {
+            "label": "changed_field",
+            "original_source_chunk_id": typo_chunk_id,
+            "normalized_source_chunk_id": expected_chunk_id,
+            "reason": "single-character source_chunk_id typo normalized within current chapter",
+        },
+    ]
+
+
+def test_extraction_rejects_source_chunk_typo_distance_greater_than_one(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    typo_chunk_id = _replace_first_two_hex_chars(str(fixture.chunk.id))
+    service = _service_with_event_source_chunk(pg_session, fixture, typo_chunk_id)
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_ambiguous_near_match_source_chunk_typo(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    original_chunk_id = str(fixture.chunk.id)
+    typo_chunk_id = _replace_first_hex_char(original_chunk_id, replacement="f")
+    changed_index = next(index for index, char in enumerate(original_chunk_id) if char != typo_chunk_id[index])
+    ambiguous_chunk_id = _replace_next_hex_char(typo_chunk_id, skip_index=changed_index)
+    ambiguous_chunk = _add_current_chapter_chunk_with_id(
+        pg_session,
+        fixture,
+        chunk_id=ambiguous_chunk_id,
+        chunk_index=2,
+    )
+    assert _uuid_distance(typo_chunk_id, original_chunk_id) == 1
+    assert _uuid_distance(typo_chunk_id, str(ambiguous_chunk.id)) == 1
+    service = _service_with_event_source_chunk(pg_session, fixture, typo_chunk_id)
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_does_not_normalize_real_chunk_id_from_other_chapter(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk_id = _replace_first_hex_char(str(fixture.chunk.id))
+    _create_outside_chapter_chunk(pg_session, fixture.novel.id, chunk_id=outside_chunk_id)
+    service = _service_with_event_source_chunk(pg_session, fixture, outside_chunk_id)
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_rejects_non_uuid_source_chunk_without_normalizing(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    service = _service_with_event_source_chunk(pg_session, fixture, "not-a-uuid")
+
+    with pytest.raises(ValueError, match="valid chunk UUIDs"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_diagnostics_write_raw_provider_response_for_invalid_json(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    raw_response = '{"events": ['
+    provider = RaisingLlmProvider(
+        LlmProviderResponseError(
+            "FastGPT LLM response must be valid JSON",
+            raw_response=raw_response,
+            provider_name="fastgpt",
+            model="deepseek-v4-pro",
+        )
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        diagnostics_dir=tmp_path,
+        extraction_max_retries=0,
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "invalid_json"
+    assert payload["raw_response_text"] == raw_response
+    assert payload["provider"] == "fastgpt"
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["chapter_id"] == str(fixture.chapter.id)
+    assert payload["chapter_index"] == fixture.chapter.chapter_index
+    assert payload["allowed_current_chapter_chunk_ids"] == [str(fixture.chunk.id)]
+    assert payload["confirmed_character_ids"] == [str(fixture.character.id)]
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "sk-" not in serialized
+    assert fixture.chunk.text not in serialized
+
+
+def test_extraction_diagnostics_write_parsed_response_for_invalid_source_chunk(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk = _create_outside_chapter_chunk(pg_session, fixture.novel.id)
+    response = {
+        "events": [
+            {
+                "character_id": str(fixture.character.id),
+                "event_summary": "Lin Qing joins the inner sect.",
+                "event_type": "identity",
+                "is_long_term_change": True,
+                "affected_fields": ["identity"],
+                "source_chunk_ids": [str(outside_chunk.id)],
+            }
+        ],
+        "state_changes": [],
+    }
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=FakeLlmProvider(response=response),
+        diagnostics_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "source_chunk_not_current_chapter"
+    assert payload["raw_parsed_response"] == response
+    assert payload["returned_source_chunk_ids"] == [str(outside_chunk.id)]
+
+
+def test_extraction_diagnostics_write_parsed_response_for_invalid_character(
+    pg_session: Session,
+    tmp_path,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    unknown_character_id = "00000000-0000-0000-0000-000000000999"
+    response = {
+        "events": [
+            {
+                "character_id": unknown_character_id,
+                "event_summary": "Unknown character event.",
+                "event_type": "identity",
+                "is_long_term_change": True,
+                "affected_fields": ["identity"],
+                "source_chunk_ids": [str(fixture.chunk.id)],
+            }
+        ],
+        "state_changes": [],
+    }
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=FakeLlmProvider(response=response),
+        diagnostics_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="confirmed character"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "invalid_character_reference"
+    assert payload["raw_parsed_response"] == response
+    assert payload["returned_character_ids"] == [unknown_character_id]
+
+
+def test_extraction_diagnostics_write_failure_does_not_mask_original_error(pg_session: Session, tmp_path) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk = _create_outside_chapter_chunk(pg_session, fixture.novel.id)
+    blocked_diagnostics_path = tmp_path / "not-a-directory"
+    blocked_diagnostics_path.write_text("file blocks mkdir", encoding="utf-8")
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=FakeLlmProvider(
+            response={
+                "events": [
+                    {
+                        "character_id": str(fixture.character.id),
+                        "event_summary": "Lin Qing joins the inner sect.",
+                        "event_type": "identity",
+                        "is_long_term_change": True,
+                        "affected_fields": ["identity"],
+                        "source_chunk_ids": [str(outside_chunk.id)],
+                    }
+                ],
+                "state_changes": [],
+            }
+        ),
+        diagnostics_dir=blocked_diagnostics_path,
+    )
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_retries_invalid_json_then_persists_once(pg_session: Session, tmp_path) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FailingThenSuccessProvider(
+        failures=[
+            LlmProviderResponseError(
+                "FastGPT LLM response must be valid JSON",
+                raw_response='{"events": [',
+                provider_name="fastgpt",
+                model="deepseek-v4-pro",
+            )
+        ],
+        response=_valid_extraction_response(fixture),
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        diagnostics_dir=tmp_path,
+        extraction_max_retries=1,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 2
+    assert len(result.events) == 1
+    assert _count_rows(pg_session, CharacterEvent) == 1
+    assert _count_rows(pg_session, CharacterStateChange) == 1
+    payload = _single_diagnostic_payload(tmp_path)
+    assert payload["failure_type"] == "invalid_json"
+    assert payload["attempt"] == 1
+    assert payload["raw_response_text"] == '{"events": ['
+
+
+def test_extraction_retry_count_is_limited(pg_session: Session, tmp_path) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FailingThenSuccessProvider(
+        failures=[
+            LlmProviderResponseError("FastGPT LLM response must be valid JSON", raw_response='{"events": ['),
+            LlmProviderResponseError("FastGPT LLM response must be valid JSON", raw_response='{"events": ['),
+        ],
+        response=_valid_extraction_response(fixture),
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        diagnostics_dir=tmp_path,
+        extraction_max_retries=1,
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 2
+    assert _count_rows(pg_session, CharacterEvent) == 0
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(tmp_path.glob("*.json"))]
+    assert [payload["attempt"] for payload in payloads] == [1, 2]
+
+
+def test_extraction_does_not_retry_source_chunk_validation_error(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    outside_chunk = _create_outside_chapter_chunk(pg_session, fixture.novel.id)
+    response = _valid_extraction_response(fixture)
+    response["events"][0]["source_chunk_ids"] = [str(outside_chunk.id)]
+    provider = FailingThenSuccessProvider(failures=[], response=response)
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        extraction_max_retries=1,
+    )
+
+    with pytest.raises(ValueError, match="current chapter"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 1
+    assert _count_rows(pg_session, CharacterEvent) == 0
+
+
+def test_extraction_does_not_retry_invalid_character_validation_error(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    response = _valid_extraction_response(fixture)
+    response["events"][0]["character_id"] = "00000000-0000-0000-0000-000000000999"
+    provider = FailingThenSuccessProvider(failures=[], response=response)
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+        extraction_max_retries=1,
+    )
+
+    with pytest.raises(ValueError, match="confirmed character"):
+        service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert provider.calls == 1
+    assert _count_rows(pg_session, CharacterEvent) == 0
 
 
 def test_extraction_rejects_state_change_without_source_chunks(pg_session: Session) -> None:
@@ -391,21 +779,48 @@ def test_extraction_blocks_unconfirmed_character_from_candidate_outputs(pg_sessi
         service.extract_chapter_candidates(fixture.chapter.id)
 
 
-def test_extraction_rejects_invalid_event_type_before_persisting(pg_session: Session) -> None:
+def test_extraction_normalizes_unknown_event_type_before_persisting(pg_session: Session) -> None:
     fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
-    service = _service_for_event_type(pg_session, fixture, "decision")
+    service = _service_for_event_type(pg_session, fixture, "discovery")
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            "Invalid event_type from LLM: decision. Allowed values: "
-            "appearance, identity, relationship, motivation, other"
-        ),
-    ):
-        service.extract_chapter_candidates(fixture.chapter.id)
+    result = service.extract_chapter_candidates(fixture.chapter.id)
 
     pg_session.flush()
-    assert _count_rows(pg_session, CharacterEvent) == 0
+    assert _count_rows(pg_session, CharacterEvent) == 1
+    assert result.events[0].event_type == "other"
+    assert "original_event_type=discovery" in result.events[0].explanation
+    assert "normalized_event_type=other" in result.events[0].explanation
+    assert service.last_normalized_event_types == [
+        {
+            "event_index": 0,
+            "original_event_type": "discovery",
+            "normalized_event_type": "other",
+            "reason": "unknown LLM event_type normalized before persistence",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [
+        ("decision", "motivation"),
+        ("alliance", "relationship"),
+        ("conflict", "other"),
+        ("unexpected_custom_type", "other"),
+    ],
+)
+def test_extraction_normalizes_common_event_type_synonyms(
+    pg_session: Session,
+    event_type: str,
+    expected: str,
+) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    service = _service_for_event_type(pg_session, fixture, event_type)
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    assert result.events[0].event_type == expected
+    assert f"original_event_type={event_type}" in result.events[0].explanation
 
 
 @pytest.mark.parametrize("event_type", ["motivation", "other"])
@@ -460,6 +875,141 @@ def test_extraction_rejects_invalid_changed_field_name(pg_session: Session) -> N
 
     with pytest.raises(ValueError, match="Invalid changed field from LLM: location"):
         service.extract_chapter_candidates(fixture.chapter.id)
+
+
+def test_extraction_normalizes_visual_keywords_string_changed_field(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing gains a new look.",
+                    "event_type": "appearance",
+                    "is_long_term_change": True,
+                    "affected_fields": ["visual_keywords"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter gives durable visual evidence.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "visual_keywords",
+                            "before": "旧袍、木剑",
+                            "after": "红眼, 黑甲、长剑；红眼\n披风",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        },
+                        {
+                            "field": "appearance",
+                            "after": "红眼, 黑甲、长剑",
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        },
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Visual keywords are durable.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+
+    fields = result.state_changes[0].changed_fields
+    assert fields[0]["before"] == ["旧袍", "木剑"]
+    assert fields[0]["after"] == ["红眼", "黑甲", "长剑", "披风"]
+    assert fields[1]["after"] == "红眼, 黑甲、长剑"
+
+
+def test_extraction_keeps_visual_keywords_list_and_rejects_invalid_type(pg_session: Session) -> None:
+    fixture = _create_extraction_fixture(pg_session, character_status=ReviewStatus.CONFIRMED.value)
+    valid_provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing gains a new look.",
+                    "event_type": "appearance",
+                    "is_long_term_change": True,
+                    "affected_fields": ["visual_keywords"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter gives durable visual evidence.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "visual_keywords",
+                            "after": ["红眼", "黑甲"],
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Visual keywords are durable.",
+                }
+            ],
+        }
+    )
+    service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=valid_provider,
+    )
+    result = service.extract_chapter_candidates(fixture.chapter.id)
+    assert result.state_changes[0].changed_fields[0]["after"] == ["红眼", "黑甲"]
+
+    invalid_provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing gains a new look again.",
+                    "event_type": "appearance",
+                    "is_long_term_change": True,
+                    "affected_fields": ["visual_keywords"],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "The chapter gives durable visual evidence.",
+                }
+            ],
+            "state_changes": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_index": 0,
+                    "changed_fields": [
+                        {
+                            "field": "visual_keywords",
+                            "after": {"bad": "shape"},
+                            "source_chunk_ids": [str(fixture.chunk.id)],
+                        }
+                    ],
+                    "source_chunk_ids": [str(fixture.chunk.id)],
+                    "explanation": "Visual keywords are durable.",
+                }
+            ],
+        }
+    )
+    invalid_service = ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=invalid_provider,
+    )
+
+    with pytest.raises(ValueError, match="visual_keywords"):
+        invalid_service.extract_chapter_candidates(fixture.chapter.id)
 
 
 def test_extraction_rejects_state_change_without_event_index(pg_session: Session) -> None:
@@ -641,6 +1191,17 @@ class ExtractionFixture:
         self.character = character
 
 
+class RaisingLlmProvider:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
+        raise self.error
+
+    def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict:
+        raise AssertionError("review is not used")
+
+
 def _service_for_event_type(pg_session: Session, fixture: ExtractionFixture, event_type: str) -> ExtractionService:
     provider = FakeLlmProvider(
         response={
@@ -725,7 +1286,41 @@ def _create_extraction_fixture(pg_session: Session, character_status: str) -> Ex
     return ExtractionFixture(novel=novel, chapter=chapter, chunk=chunk, character=character)
 
 
-def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk:
+def _valid_extraction_response(fixture: ExtractionFixture) -> dict:
+    return {
+        "events": [
+            {
+                "character_id": str(fixture.character.id),
+                "event_summary": "Lin Qing joins the inner sect.",
+                "event_type": "identity",
+                "is_long_term_change": True,
+                "affected_fields": ["identity"],
+                "source_chunk_ids": [str(fixture.chunk.id)],
+                "confidence": 0.92,
+                "explanation": "The chapter explicitly says the sect accepted him.",
+            }
+        ],
+        "state_changes": [
+            {
+                "character_id": str(fixture.character.id),
+                "event_index": 0,
+                "changed_fields": [
+                    {
+                        "field": "identity",
+                        "before": "outer disciple",
+                        "after": "inner disciple",
+                        "source_chunk_ids": [str(fixture.chunk.id)],
+                    }
+                ],
+                "source_chunk_ids": [str(fixture.chunk.id)],
+                "confidence": 0.9,
+                "explanation": "Identity changes from outer disciple to inner disciple.",
+            }
+        ],
+    }
+
+
+def _create_outside_chapter_chunk(pg_session: Session, novel_id, *, chunk_id=None) -> ChapterChunk:
     chapter = Chapter(
         novel_id=novel_id,
         chapter_index=4,
@@ -738,6 +1333,7 @@ def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk
     pg_session.add(chapter)
     pg_session.flush()
     chunk = ChapterChunk(
+        id=chunk_id,
         novel_id=novel_id,
         chapter_id=chapter.id,
         chapter_index=4,
@@ -753,6 +1349,94 @@ def _create_outside_chapter_chunk(pg_session: Session, novel_id) -> ChapterChunk
     pg_session.add(chunk)
     pg_session.commit()
     return chunk
+
+
+def _add_current_chapter_chunk_with_id(
+    pg_session: Session,
+    fixture: ExtractionFixture,
+    *,
+    chunk_id: str,
+    chunk_index: int,
+) -> ChapterChunk:
+    chunk = ChapterChunk(
+        id=chunk_id,
+        novel_id=fixture.novel.id,
+        chapter_id=fixture.chapter.id,
+        chapter_index=fixture.chapter.chapter_index,
+        chunk_index=chunk_index,
+        text="Additional current chapter evidence.",
+        start_char=43,
+        end_char=78,
+        char_count=35,
+        token_count=35,
+        checksum=f"chunk-3-{chunk_index}",
+        meta={},
+    )
+    pg_session.add(chunk)
+    pg_session.commit()
+    return chunk
+
+
+def _service_with_event_source_chunk(
+    pg_session: Session,
+    fixture: ExtractionFixture,
+    source_chunk_id: str,
+) -> ExtractionService:
+    provider = FakeLlmProvider(
+        response={
+            "events": [
+                {
+                    "character_id": str(fixture.character.id),
+                    "event_summary": "Lin Qing joins the inner sect.",
+                    "event_type": "identity",
+                    "is_long_term_change": True,
+                    "affected_fields": ["identity"],
+                    "source_chunk_ids": [source_chunk_id],
+                }
+            ],
+            "state_changes": [],
+        }
+    )
+    return ExtractionService(
+        state_repository=StateRepository(pg_session),
+        chunk_repository=ChunkRepository(pg_session),
+        character_repository=CharacterRepository(pg_session),
+        llm_provider=provider,
+    )
+
+
+def _replace_first_hex_char(value: str, *, replacement: str = "0") -> str:
+    chars = list(value)
+    for index, char in enumerate(chars):
+        if char == "-":
+            continue
+        if char != replacement:
+            chars[index] = replacement
+            return "".join(chars)
+    chars[0] = "1"
+    return "".join(chars)
+
+
+def _replace_next_hex_char(value: str, *, skip_index: int, replacement: str = "0") -> str:
+    chars = list(value)
+    for index, char in enumerate(chars):
+        if index == skip_index or char == "-":
+            continue
+        if char != replacement:
+            chars[index] = replacement
+            return "".join(chars)
+    chars[0 if skip_index != 0 else 1] = "1"
+    return "".join(chars)
+
+
+def _replace_first_two_hex_chars(value: str) -> str:
+    first = _replace_first_hex_char(value, replacement="0")
+    changed_index = next(index for index, char in enumerate(value) if char != first[index])
+    return _replace_next_hex_char(first, skip_index=changed_index, replacement="1")
+
+
+def _uuid_distance(left: str, right: str) -> int:
+    return sum(1 for a, b in zip(left, right, strict=True) if a != b)
 
 
 def _create_other_novel_chunk(pg_session: Session) -> ChapterChunk:
@@ -796,3 +1480,9 @@ def _create_other_novel_chunk(pg_session: Session) -> ChapterChunk:
 
 def _count_rows(pg_session: Session, model: type) -> int:
     return pg_session.scalar(select(func.count()).select_from(model)) or 0
+
+
+def _single_diagnostic_payload(path) -> dict:
+    files = list(path.glob("*.json"))
+    assert len(files) == 1
+    return json.loads(files[0].read_text(encoding="utf-8"))

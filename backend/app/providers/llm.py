@@ -8,6 +8,25 @@ from typing import Any, Protocol
 import httpx
 
 
+class LlmProviderResponseError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response: str | None = None,
+        parsed_response: dict[str, Any] | None = None,
+        provider_name: str | None = None,
+        model: str | None = None,
+        repair_notes: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
+        self.parsed_response = parsed_response
+        self.provider_name = provider_name
+        self.model = model
+        self.repair_notes = repair_notes or []
+
+
 class LlmProvider(Protocol):
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         ...
@@ -35,6 +54,63 @@ class FakeLlmProvider:
 PostJson = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
 
 
+def repair_json_content(content: str) -> tuple[str, list[str]]:
+    cleaned = content.strip()
+    notes: list[str] = []
+    fenced_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        cleaned = fenced_match.group(1).strip()
+        notes.append("stripped_code_fence")
+
+    try:
+        json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    else:
+        return cleaned, notes
+
+    spans = _json_object_spans(cleaned)
+    if len(spans) > 1:
+        raise ValueError("FastGPT LLM response contains multiple JSON objects")
+    if not spans:
+        raise ValueError("FastGPT LLM response must be valid JSON and contain a complete JSON object")
+
+    start, end = spans[0]
+    candidate = cleaned[start:end]
+    if start != 0 or cleaned[end:].strip():
+        notes.extend(["extracted_json_object", "removed_surrounding_text"])
+    return candidate, notes
+
+
+def _json_object_spans(value: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    in_string = False
+    escape = False
+    depth = 0
+    start: int | None = None
+    for index, char in enumerate(value):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                spans.append((start, index + 1))
+                start = None
+    return spans
+
+
 class FastGptLlmProvider:
     """OpenAI-compatible chat completions provider for FastGPT workflows."""
 
@@ -58,6 +134,7 @@ class FastGptLlmProvider:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.provider_name = "fastgpt"
         self.timeout = timeout
         self.json_mode = json_mode
         self.max_tokens = max_tokens
@@ -65,7 +142,15 @@ class FastGptLlmProvider:
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         parsed = self._generate_parsed_json(system_prompt, user_prompt)
-        self._validate_extraction_schema(parsed)
+        try:
+            self._validate_extraction_schema(parsed)
+        except ValueError as exc:
+            raise LlmProviderResponseError(
+                str(exc),
+                parsed_response=parsed,
+                provider_name="fastgpt",
+                model=self.model,
+            ) from exc
         return parsed
 
     def generate_review_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
@@ -111,16 +196,33 @@ class FastGptLlmProvider:
         return content
 
     def _parse_json_content(self, content: str) -> dict[str, Any]:
-        cleaned = content.strip()
-        fenced_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
-        if fenced_match:
-            cleaned = fenced_match.group(1).strip()
+        try:
+            cleaned, repair_notes = repair_json_content(content)
+        except ValueError as exc:
+            raise LlmProviderResponseError(
+                str(exc),
+                raw_response=content,
+                provider_name="fastgpt",
+                model=self.model,
+            ) from exc
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            raise ValueError("FastGPT LLM response must be valid JSON") from exc
+            raise LlmProviderResponseError(
+                "FastGPT LLM response must be valid JSON",
+                raw_response=content,
+                provider_name="fastgpt",
+                model=self.model,
+                repair_notes=repair_notes,
+            ) from exc
         if not isinstance(parsed, dict):
-            raise ValueError("FastGPT LLM response JSON must be an object")
+            raise LlmProviderResponseError(
+                "FastGPT LLM response JSON must be an object",
+                raw_response=content,
+                provider_name="fastgpt",
+                model=self.model,
+                repair_notes=repair_notes,
+            )
         return parsed
 
     def _validate_extraction_schema(self, parsed: dict[str, Any]) -> None:
